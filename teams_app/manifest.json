@@ -1,0 +1,65 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.2",
+  "id": "11f95e11-5e0b-40c2-9cdf-a16761df238f",
+  "packageName": "com.tecnogera.n1",
+  "developer": {
+    "name": "Tecnogera",
+    "websiteUrl": "https://www.tecnogera.com.br",
+    "privacyUrl": "https://www.tecnogera.com.br/privacidade",
+    "termsOfUseUrl": "https://www.tecnogera.com.br/termos"
+  },
+  "name": { "short": "Tecnogera N1 Notifier" },
+  "description": {
+    "short": "Notificações de tickets N1 no Teams",
+    "full": "App para notificar proativamente o usuário no Teams quando um ticket de TI é aberto no Movidesk."
+  },
+  "icons": { "outline": "outline.png", "color": "color.png" },
+  "accentColor": "#6264A7",
+  "staticTabs": [
+    {
+      "entityId": "home",
+      "name": "Tecnogera N1",
+      "scopes": ["personal"],
+      "contentUrl": "https://www.tecnogera.com.br/",
+      "websiteUrl": "https://www.tecnogera.com.br/"
+    }
+  ],
+  "bots": [
+    {
+      "botId": "11f95e11-5e0b-40c2-9cdf-a16761df238f",
+      "scopes": ["personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "devicePermissions": [],
+  "webApplicationInfo": {
+    "id": "11f95e11-5e0b-40c2-9cdf-a16761df238f",
+    "resource": "api://11f95e11-5e0b-40c2-9cdf-a16761df238f"
+  },
+  "activities": {
+    "activityTypes": [
+      {
+        "type": "ticketTriagem",
+        "description": "Notificação de triagem do ticket",
+        "templateText": "Ticket ${ticketId}: ${subject}"
+      }
+    ]
+  },
+  "authorization": { "permissions": { "resourceSpecific": [] } },
+  "validDomains": [
+    "www.tecnogera.com.br",
+    "teams.microsoft.com",
+    "graph.microsoft.com",
+    "login.microsoftonline.com",
+    "login.windows.net",
+    "token.botframework.com",
+    "smba.trafficmanager.net",
+    "api.botframework.com",
+    "webchat.botframework.com",
+    "<SEU-SUBDOMINIO>.ngrok-free.app"
+  ]
+}
