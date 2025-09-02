@@ -39,6 +39,8 @@ from app.teams_graph import (
     diag_user,
 )
 
+from app import kb
+
 load_dotenv()
 
 # -----------------------------------------------------------------------------#
@@ -151,6 +153,14 @@ if ENABLE_TEAMS_BOT:
         memory = MemoryStorage()
         conversation_state = ConversationState(memory)
         bot = N1Bot(conversation_state)
+
+        @app.post("/debug/kb/reindex")
+        def _kb_reindex():
+            return kb.reindex()
+
+        @app.get("/debug/kb/search")
+        def _kb_search(q: str, k: int = 5):
+            return {"results": kb.search(q, k)}
 
         @app.post("/api/messages")
         async def messages(request: Request):
