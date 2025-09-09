@@ -1,7 +1,7 @@
 # app/movidesk_client.py
 import os
 from http import HTTPStatus
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -12,10 +12,11 @@ load_dotenv()
 MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
 
 
-
 class MovideskError(Exception):
     pass
 
+
+# ---------------- Internos ----------------
 
 def _get_token() -> str:
     token = os.getenv("MOVIDESK_TOKEN", "").strip()
@@ -61,6 +62,27 @@ def _contains_any(haystack: str, needles: List[str]) -> bool:
         if h == nrm or (nrm in h):
             return True
     return False
+
+
+def _ok_response(r: httpx.Response) -> dict:
+    try:
+        return r.json()
+    except Exception:
+        return {"status": r.status_code}
+
+
+def _agent_created_by() -> Optional[Dict[str, str]]:
+    """
+    Retorna o objeto 'createdBy' para assinar a ação com um agente específico.
+    Usa MOVIDESK_API_AGENT_ID (GUID) ou MOVIDESK_API_AGENT_EMAIL.
+    """
+    agent_id = os.getenv("MOVIDESK_API_AGENT_ID", "").strip()
+    agent_email = os.getenv("MOVIDESK_API_AGENT_EMAIL", "").strip()
+    if agent_id:
+        return {"id": agent_id}
+    if agent_email:
+        return {"email": agent_email}
+    return None
 
 
 # ---------------- Ticket por ID ----------------
@@ -219,7 +241,7 @@ def get_latest_ticket_for_email_account_multi(allowed_accounts: List[str], max_t
 
     checked = 0
     page_size = 100
-    # alcance total proporcional ao que o caller pediu
+    # aumenta o alcance total proporcional ao que o caller pediu
     max_items = max(500, max_take * 20)
 
     for use_past in (False, True):
@@ -364,24 +386,18 @@ def get_ticket_text_bundle(ticket_id: int) -> dict:
 
 # ---------------- Ações/Notas públicas + fechamento ----------------
 
-def _ok_response(r: httpx.Response) -> dict:
-    try:
-        data = r.json()
-    except Exception:
-        data = {"status": r.status_code}
-    return data
-
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 def add_public_note(ticket_id: int, note_text: str) -> dict:
     """
-    Cria uma AÇÃO pública na timeline do ticket.
-    Tenta nas seguintes ordens (todas com ?token=...&id=... na URL):
-      1) POST /tickets  (X-HTTP-Method-Override: PATCH)  -> actions[id=0]
-      2) PATCH /tickets                                  -> actions[id=0]
-      3) POST /tickets/{id}/actions                      -> fallback
-      4) POST /tickets  (Override)                       -> notes[id=0]
-      5) PATCH /tickets                                  -> notes[id=0]
+    Cria uma **AÇÃO pública** na timeline do ticket, assinando (se possível) com o agente
+    definido em MOVIDESK_API_AGENT_EMAIL ou MOVIDESK_API_AGENT_ID.
+
+    Ordem de tentativas (todas com ?token=...&id=...):
+      1) PATCH /tickets (actions[id=0])                 ← preferencial
+      2) POST /tickets (X-HTTP-Method-Override: PATCH)  ← quando PATCH é bloqueado
+      3) POST /tickets/{id}/actions                      ← fallback legado
+      4) PATCH /tickets (notes[id=0])                    ← último recurso (nota)
+      5) POST /tickets override (notes[id=0])            ← último recurso (nota)
     """
     token = _get_token()
     headers_json = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -391,68 +407,94 @@ def add_public_note(ticket_id: int, note_text: str) -> dict:
     if not text:
         raise MovideskError("Texto da nota/ação vazio.")
 
-    def _ok(r: httpx.Response) -> bool:
-        return r.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT)
-
-    def _resp(r: httpx.Response) -> dict:
-        try:
-            return r.json()
-        except Exception:
-            return {"status": r.status_code}
-
-    # payload preferencial: ACTION pública
-    body_action = {
-        "actions": [
-            {
-                "id": 0,                   # id=0 => inserir
-                "description": text,
-                "isPublic": True,
-                "isHtmlDescription": False,
-                "origin": 4,               # Gatilho do sistema
-                "type": 1                  # Pública
-            }
-        ]
+    created_by = _agent_created_by()
+    # 1 = pública, 2 = interna (documentação Movidesk)
+    action_obj: Dict[str, Any] = {
+        "id": 0,
+        "description": text,
+        "isHtmlDescription": False,
+        "type": 2,         # <<< PÚBLICA
+        "origin": 9,       # Web API (opcional, para clareza no histórico)
     }
+    if created_by:
+        action_obj["createdBy"] = created_by
 
-    # 1) POST override PATCH /tickets (actions)
+    # Payload para actions
+    body_actions = {"id": int(ticket_id), "actions": [action_obj]}
+
+    # Payload para notes (fallback)
+    note_obj: Dict[str, Any] = {
+        "id": 0,
+        "description": text,
+        "isPublic": True
+    }
+    if created_by:
+        note_obj["createdBy"] = created_by
+    body_notes = {"id": int(ticket_id), "notes": [note_obj]}
+
+    attempts_log: List[Dict[str, Any]] = []
+
+    # 1) PATCH /tickets (actions)
+    with httpx.Client(timeout=30, headers=headers_json) as c1:
+        r1 = c1.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_actions)
+        if r1.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT):
+            return {
+                "ok": True, "status": r1.status_code, "attempt": "PATCH /tickets (actions)",
+                "response": _ok_response(r1), "attempts": attempts_log
+            }
+        attempts_log.append({"label": "PATCH /tickets (actions)", "status": r1.status_code, "body": r1.text[:600]})
+
+    # 2) POST override PATCH /tickets (actions)
     headers_override = dict(headers_json)
     headers_override["X-HTTP-Method-Override"] = "PATCH"
-    with httpx.Client(timeout=30, headers=headers_override) as c1:
-        r1 = c1.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_action)
-        if _ok(r1):
-            return {"ok": True, "status": r1.status_code, "attempt": "POST override PATCH /tickets (actions)", "response": _resp(r1)}
+    with httpx.Client(timeout=30, headers=headers_override) as c2:
+        r2 = c2.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_actions)
+        if r2.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT):
+            return {
+                "ok": True, "status": r2.status_code, "attempt": "POST override PATCH /tickets (actions)",
+                "response": _ok_response(r2), "attempts": attempts_log
+            }
+        attempts_log.append({"label": "POST override PATCH /tickets (actions)", "status": r2.status_code, "body": r2.text[:600]})
 
-    # 2) PATCH /tickets (actions)
-    with httpx.Client(timeout=30, headers=headers_json) as c2:
-        r2 = c2.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_action)
-        if _ok(r2):
-            return {"ok": True, "status": r2.status_code, "attempt": "PATCH /tickets (actions)", "response": _resp(r2)}
-
-    # 3) POST /tickets/{id}/actions (fallback)
+    # 3) POST /tickets/{id}/actions  (alguns tenants permitem)
     body_post_action = {
         "description": text,
-        "isPublic": True,
         "isHtmlDescription": False,
-        "origin": 4,
-        "type": 1,
+        "isPublic": True,   # quando disponível nesse endpoint
+        "origin": 9,
+        "type": 2,
     }
+    if created_by:
+        body_post_action["createdBy"] = created_by
+
     with httpx.Client(timeout=30, headers=headers_json) as c3:
         r3 = c3.post(f"{MOVIDESK_BASE}/tickets/{ticket_id}/actions", params={"token": token}, json=body_post_action)
-        if _ok(r3):
-            return {"ok": True, "status": r3.status_code, "attempt": "POST /tickets/{id}/actions", "response": _resp(r3)}
+        if r3.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT):
+            return {
+                "ok": True, "status": r3.status_code, "attempt": "POST /tickets/{id}/actions",
+                "response": _ok_response(r3), "attempts": attempts_log
+            }
+        attempts_log.append({"label": "POST /tickets/{id}/actions", "status": r3.status_code, "body": r3.text[:600]})
 
-    # 4) NOTES (override primeiro)
-    body_note = {"notes": [{"id": 0, "description": text, "isPublic": True}]}
-    with httpx.Client(timeout=30, headers=headers_override) as c4:
-        r4 = c4.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_note)
-        if _ok(r4):
-            return {"ok": True, "status": r4.status_code, "attempt": "POST override PATCH /tickets (notes)", "kind": "note", "response": _resp(r4)}
+    # 4) PATCH /tickets (notes) — último recurso (aparece em "Notas")
+    with httpx.Client(timeout=30, headers=headers_json) as c4:
+        r4 = c4.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_notes)
+        if r4.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT):
+            return {
+                "ok": True, "status": r4.status_code, "attempt": "PATCH /tickets (notes)",
+                "kind": "note", "response": _ok_response(r4), "attempts": attempts_log
+            }
+        attempts_log.append({"label": "PATCH /tickets (notes)", "status": r4.status_code, "body": r4.text[:600]})
 
-    # 5) PATCH /tickets (notes)
-    with httpx.Client(timeout=30, headers=headers_json) as c5:
-        r5 = c5.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_note)
-        if _ok(r5):
-            return {"ok": True, "status": r5.status_code, "attempt": "PATCH /tickets (notes)", "kind": "note", "response": _resp(r5)}
+    # 5) POST override PATCH /tickets (notes)
+    with httpx.Client(timeout=30, headers=headers_override) as c5:
+        r5 = c5.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_notes)
+        if r5.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT):
+            return {
+                "ok": True, "status": r5.status_code, "attempt": "POST override PATCH /tickets (notes)",
+                "kind": "note", "response": _ok_response(r5), "attempts": attempts_log
+            }
+        attempts_log.append({"label": "POST override PATCH /tickets (notes)", "status": r5.status_code, "body": r5.text[:600]})
 
         try:
             last_detail = r5.text[:1200]
@@ -460,12 +502,12 @@ def add_public_note(ticket_id: int, note_text: str) -> dict:
             last_detail = f"HTTP {r5.status_code} (sem corpo)"
 
     raise MovideskError(
-        f"[tickets] Falha ao anexar ação/nota pública no ticket {ticket_id}. Última resposta: {last_detail}"
+        f"[tickets] Falha ao anexar AÇÃO/nota no ticket {ticket_id}. Última resposta: {last_detail}"
     )
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: str | None = None) -> dict:
+def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: Optional[str] = None) -> dict:
     """
     Ajusta o status via PATCH /tickets (&id na query) ou override por POST,
     com 'justification' opcional (se sua base exigir motivo).
@@ -473,7 +515,7 @@ def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: 
     token = _get_token()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     params = {"token": token, "id": str(int(ticket_id))}
-    body = {"status": status_name}
+    body: Dict[str, Any] = {"status": status_name}
     if justification:
         body["justification"] = justification
 
@@ -483,7 +525,7 @@ def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: 
         if r1.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT, HTTPStatus.CREATED):
             return {"ok": True, "status": r1.status_code, "attempt": "PATCH /tickets (status)", "response": _ok_response(r1)}
 
-    # Override (POST com X-HTTP-Method-Override: PATCH)
+    # Override
     headers2 = dict(headers)
     headers2["X-HTTP-Method-Override"] = "PATCH"
     with httpx.Client(timeout=20, headers=headers2) as c2:
@@ -494,40 +536,43 @@ def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: 
     _raise_http_error(r1, "tickets (close_ticket)")
 
 
-# ---------------- Utilitários de auditoria ----------------
+# ---------------- Utilitários de auditoria (debug rápido) ----------------
 
 def list_actions(ticket_id: int, top: int = 10) -> List[dict]:
+    """
+    Tenta primeiro via /tickets/{id}?$expand=actions (mais compatível);
+    se falhar, cai para /tickets/{id}/actions.
+    """
     token = _get_token()
     headers = {"Accept": "application/json"}
     with httpx.Client(timeout=20, headers=headers) as client:
-        r = client.get(
-            f"{MOVIDESK_BASE}/tickets/{ticket_id}/actions",
-            params={"token": token, "$orderby": "id desc", "$top": top},
-        )
-        if not _ensure_ok(r, "tickets/{id}/actions"):
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-
-
-def list_actions_expand(ticket_id: int, top: int = 10) -> List[dict]:
-    token = _get_token()
-    headers = {"Accept": "application/json"}
-    with httpx.Client(timeout=20, headers=headers) as client:
+        # expand=actions
         r = client.get(
             f"{MOVIDESK_BASE}/tickets/{ticket_id}",
             params={"token": token, "$select": "id", "$expand": f"actions($orderby=id desc;$top={top})"},
         )
-        if not _ensure_ok(r, "tickets/{id} expand actions"):
+        if _ensure_ok(r, "tickets/{id} expand actions"):
+            data = r.json() or {}
+            acts = data.get("actions") or []
+            if isinstance(acts, list):
+                return acts
+
+        # fallback endpoint direto
+        r2 = client.get(
+            f"{MOVIDESK_BASE}/tickets/{ticket_id}/actions",
+            params={"token": token, "$orderby": "id desc", "$top": top},
+        )
+        if not _ensure_ok(r2, "tickets/{id}/actions"):
             return []
-        data = r.json() or {}
-        return data.get("actions") or []
+        data2 = r2.json()
+        return data2 if isinstance(data2, list) else []
 
 
 def list_notes(ticket_id: int, top: int = 10) -> List[dict]:
     token = _get_token()
     headers = {"Accept": "application/json"}
     with httpx.Client(timeout=20, headers=headers) as client:
+        # expand=notes(...): retorna junto ao ticket
         r = client.get(
             f"{MOVIDESK_BASE}/tickets/{ticket_id}",
             params={"token": token, "$select": "id", "$expand": f"notes($orderby=id desc;$top={top})"},
