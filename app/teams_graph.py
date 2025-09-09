@@ -1,237 +1,316 @@
 # app/teams_graph.py
-import os, re, time
-import httpx
-from urllib.parse import quote, urlencode
-from loguru import logger
+from __future__ import annotations
 
-MS_TENANT_ID = os.getenv("MS_TENANT_ID", "")
-MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
-MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
-TEAMS_APP_ID_ENV = os.getenv("TEAMS_APP_ID", "")  # GUID do app no catálogo (ou externalId)
+import os
+import time
+from typing import Optional, Dict, Any
 
-AUTH_URL = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
-GRAPH = "https://graph.microsoft.com/v1.0"
+import requests
 
-class TeamsGraphError(Exception):
+
+class TeamsGraphError(RuntimeError):
     pass
 
-_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-def _looks_like_guid(s: str) -> bool:
-    return bool(_GUID_RE.match(s or ""))
+GRAPH = "https://graph.microsoft.com/v1.0"
 
-def _get_app_token() -> str:
-    if not (MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET):
-        raise TeamsGraphError("Credenciais MS_* ausentes no .env")
+
+# ---------------- Credenciais (via ambiente, com fallbacks) ----------------
+
+def _env(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return default
+
+# Preferência: MS_* ; depois TEAMS_* ; por fim BOT_* (mesma App Registration)
+TENANT_ID = _env("MS_TENANT_ID", "TEAMS_TENANT_ID")
+CLIENT_ID = _env("MS_CLIENT_ID", "TEAMS_CLIENT_ID", "BOT_APP_ID")
+CLIENT_SECRET = _env("MS_CLIENT_SECRET", "TEAMS_CLIENT_SECRET", "BOT_APP_PASSWORD")
+
+
+# ---------------- HTTP helpers ----------------
+
+def _token(scope: str = "https://graph.microsoft.com/.default") -> str:
+    """
+    App-only token (Client Credentials). A App Registration precisa de permissões de APLICAÇÃO:
+      - Chat.ReadWrite.All
+      - User.Read.All
+      - (Opcional) TeamsAppInstallation.ReadForUser.All para listar apps instalados
+    """
+    if not TENANT_ID or not CLIENT_ID or not CLIENT_SECRET:
+        raise TeamsGraphError(
+            "Credenciais do Graph ausentes. Defina MS_TENANT_ID, MS_CLIENT_ID e MS_CLIENT_SECRET "
+            "(ou equivalentes TEAMS_* / BOT_*)."
+        )
     data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": scope,
         "grant_type": "client_credentials",
-        "client_id": MS_CLIENT_ID,
-        "client_secret": MS_CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default",
     }
-    with httpx.Client(timeout=20) as c:
-        r = c.post(AUTH_URL, data=data)
-        if r.status_code != 200:
-            raise TeamsGraphError(f"Falha ao obter token: {r.status_code} {r.text}")
-        return r.json()["access_token"]
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    r = requests.post(url, data=data, timeout=30)
+    if r.status_code != 200:
+        raise TeamsGraphError(f"Falha ao obter token: {r.status_code} {r.text}")
+    return r.json()["access_token"]
 
-def _g(method: str, url: str, token: str, **kwargs):
+
+def _g(method: str, url: str, token: str, **kwargs) -> requests.Response:
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
-    headers["Content-Type"] = "application/json"
-    timeout = kwargs.pop("timeout", 30)
-    with httpx.Client(timeout=timeout, headers=headers) as c:
-        return c.request(method, url, **kwargs)
-
-# ---------- resolver App ID do catálogo sem ler catálogo (evita AppCatalog.Read.All) ----------
-_CATALOG_ID_CACHE: str | None = None
-
-def _resolve_catalog_app_id(token: str) -> str:
-    global _CATALOG_ID_CACHE
-    if _CATALOG_ID_CACHE:
-        return _CATALOG_ID_CACHE
-
-    if not TEAMS_APP_ID_ENV:
-        raise TeamsGraphError("TEAMS_APP_ID não definido no .env")
-
-    if _looks_like_guid(TEAMS_APP_ID_ENV):
-        _CATALOG_ID_CACHE = TEAMS_APP_ID_ENV
-        return _CATALOG_ID_CACHE
-
-    # Se TEAMS_APP_ID_ENV for externalId, isso exige AppCatalog.Read.All:
-    url_filter = f"{GRAPH}/appCatalogs/teamsApps?$filter=externalId eq '{TEAMS_APP_ID_ENV}'"
-    r = _g("GET", url_filter, token)
-    if r.status_code != 200:
-        raise TeamsGraphError(f"Falha ao filtrar externalId: {r.status_code} {r.text}")
-    items = r.json().get("value", [])
-    if not items:
-        raise TeamsGraphError("App não encontrado no catálogo pelo externalId.")
-    _CATALOG_ID_CACHE = items[0]["id"]
-    return _CATALOG_ID_CACHE
-
-# ---------------- helpers -----------------
-def _build_teams_deeplink_to_app(catalog_app_id: str, ticket_id: int) -> str:
-    # Deep link para a aba pessoal "home" definida no manifest
-    from urllib.parse import urlencode
-    label = f"Ticket {ticket_id}"
-    qs = urlencode({"label": label})
-    return f"https://teams.microsoft.com/l/entity/{catalog_app_id}/home?{qs}"
+    headers.setdefault("Content-Type", "application/json")
+    return requests.request(method, url, headers=headers, timeout=30, **kwargs)
 
 
-# ---------------- operações de usuário/app -----------------
-def get_user_by_email(email: str) -> dict:
-    token = _get_app_token()
-    url = f"{GRAPH}/users/{email}"
-    r = _g("GET", url, token)
-    if r.status_code != 200:
-        raise TeamsGraphError(f"GET user por email falhou: {r.status_code} {r.text}")
-    return r.json()
+# ---------------- Usuários / Chats ----------------
 
-def list_user_installed_apps(user_id: str) -> list[dict]:
+def get_user_id_by_mail(email: str) -> Optional[str]:
     """
-    Lista os apps instalados no usuário (inclui teamsApp e teamsAppDefinition p/ ver versão).
+    Busca o usuário pelo campo 'mail' e, se não achar, tenta 'userPrincipalName'.
     """
-    token = _get_app_token()
-    url = f"{GRAPH}/users/{user_id}/teamwork/installedApps?$expand=teamsApp,teamsAppDefinition"
-    r = _g("GET", url, token)
-    if r.status_code != 200:
-        raise TeamsGraphError(f"Listar apps instalados falhou: {r.status_code} {r.text}")
-    items = []
-    for it in r.json().get("value", []):
-        app = it.get("teamsApp") or {}
-        defn = it.get("teamsAppDefinition") or {}
-        items.append({
-            "installationId": it.get("id"),
-            "teamsAppId": app.get("id"),
-            "teamsAppExternalId": app.get("externalId"),
-            "displayName": app.get("displayName"),
-            "version": defn.get("version"),
-            "publishingState": defn.get("publishingState"),
-        })
-    return items
+    t = _token()
+    # 1) procurar por mail
+    r1 = _g("GET", f"{GRAPH}/users?$filter=mail eq '{email}'", t)
+    if r1.status_code != 200:
+        raise TeamsGraphError(f"Falha ao buscar usuário (mail): {r1.status_code} {r1.text}")
+    v1 = r1.json().get("value", [])
+    if v1:
+        return v1[0].get("id")
 
-def _get_installation_id_for_app(user_id: str, catalog_id: str) -> str | None:
-    token = _get_app_token()
-    url = f"{GRAPH}/users/{user_id}/teamwork/installedApps?$expand=teamsApp"
-    r = _g("GET", url, token)
-    if r.status_code != 200:
-        raise TeamsGraphError(f"Verificar apps instalados falhou: {r.status_code} {r.text}")
-    for item in r.json().get("value", []):
-        app = item.get("teamsApp") or {}
-        if app.get("id") == catalog_id:
-            return item.get("id")  # installationId
+    # 2) tentar por userPrincipalName
+    r2 = _g("GET", f"{GRAPH}/users/{email}", t)
+    if r2.status_code == 200:
+        return r2.json().get("id")
+
     return None
 
-def is_app_installed_for_user(user_id: str) -> bool:
-    token = _get_app_token()
-    catalog_id = _resolve_catalog_app_id(token)
-    return _get_installation_id_for_app(user_id, catalog_id) is not None
 
-def install_app_for_user(user_id: str):
-    token = _get_app_token()
-    catalog_id = _resolve_catalog_app_id(token)
-    url = f"{GRAPH}/users/{user_id}/teamwork/installedApps"
-    body = {
-        "@odata.type": "#microsoft.graph.userScopeTeamsAppInstallation",
-        "teamsApp@odata.bind": f"{GRAPH}/appCatalogs/teamsApps/{catalog_id}"
+def get_user_by_email(email: str) -> Dict[str, Any]:
+    """
+    Retorna dict com 'id', 'mail', 'displayName' (quando possível).
+    """
+    t = _token()
+    # tenta por mail
+    r1 = _g("GET", f"{GRAPH}/users?$filter=mail eq '{email}'", t)
+    if r1.status_code == 200:
+        v = r1.json().get("value", [])
+        if v:
+            u = v[0]
+            return {"id": u.get("id"), "mail": u.get("mail") or email, "displayName": u.get("displayName")}
+    # tenta por UPN
+    r2 = _g("GET", f"{GRAPH}/users/{email}", t)
+    if r2.status_code == 200:
+        u = r2.json()
+        return {"id": u.get("id"), "mail": u.get("mail") or email, "displayName": u.get("displayName")}
+    return {"id": None, "mail": email, "displayName": None}
+
+
+def _get_or_create_one_on_one_chat(user_id: str, token: str) -> str:
+    """
+    Obtém um chat 1:1 existente; se não houver, cria um novo.
+    """
+    # tenta pegar um chat existente do usuário (mais recente)
+    r1 = _g("GET", f"{GRAPH}/users/{user_id}/chats?$top=1", token)
+    if r1.status_code == 200:
+        items = r1.json().get("value", [])
+        if items:
+            return items[0]["id"]
+
+    # cria um chat 1:1
+    payload = {
+        "chatType": "oneOnOne",
+        "members": [
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/users('{user_id}')",
+            }
+        ],
     }
-    r = _g("POST", url, token, json=body, timeout=60)
-    if r.status_code not in (201, 202):
-        raise TeamsGraphError(f"Instalação do app falhou: {r.status_code} {r.text}")
+    r2 = _g("POST", f"{GRAPH}/chats", token, json=payload)
+    if r2.status_code not in (201, 409):
+        raise TeamsGraphError(f"Falha ao criar chat: {r2.status_code} {r2.text}")
+    if r2.status_code == 201:
+        return r2.json()["id"]
 
-def upgrade_user_app_installation(user_id: str, installation_id: str):
-    token = _get_app_token()
-    url = f"{GRAPH}/users/{user_id}/teamwork/installedApps/{installation_id}/upgrade"
-    r = _g("POST", url, token, json={}, timeout=30)
-    if r.status_code not in (200, 202, 204):
-        raise TeamsGraphError(f"Upgrade do app falhou: {r.status_code} {r.text}")
+    # conflito — aguarda e busca de novo
+    time.sleep(1.0)
+    r3 = _g("GET", f"{GRAPH}/users/{user_id}/chats?$top=1", token)
+    if r3.status_code == 200 and r3.json().get("value"):
+        return r3.json()["value"][0]["id"]
+    raise TeamsGraphError("Não foi possível obter/criar chat 1:1.")
 
-def ensure_app_installed_and_current(user_id: str, wait_seconds: int = 120, interval: float = 3.0):
+
+def _send_chat_message(chat_id: str, text: str, token: str) -> None:
+    body = {"body": {"contentType": "text", "content": text}}
+    r = _g("POST", f"{GRAPH}/chats/{chat_id}/messages", token, json=body)
+    if r.status_code not in (201, 200):
+        raise TeamsGraphError(f"Falha ao enviar mensagem: {r.status_code} {r.text}")
+
+
+# ---------------- Diagnóstico & Compat ----------------
+
+def diag_token_info() -> Dict[str, Any]:
     """
-    - Instala se faltar;
-    - Faz upgrade para a última versão publicada (se disponível);
-    - Faz polling até o Graph refletir as mudanças.
+    Retorna informações básicas de diagnóstico do token e tenant.
     """
-    token = _get_app_token()
-    catalog_id = _resolve_catalog_app_id(token)
-
-    inst_id = _get_installation_id_for_app(user_id, catalog_id)
-    if not inst_id:
-        logger.info(f"[TEAMS] App não instalado para user {user_id}. Instalando…")
-        install_app_for_user(user_id)
-
-        deadline = time.time() + wait_seconds
-        while time.time() < deadline:
-            time.sleep(interval)
-            inst_id = _get_installation_id_for_app(user_id, catalog_id)
-            if inst_id:
-                logger.info(f"[TEAMS] App instalado e visível para user {user_id}.")
-                break
-        if not inst_id:
-            raise TeamsGraphError("App não ficou disponível para o usuário dentro do tempo de espera.")
-
-    # tenta upgrade para garantir versão mais recente
     try:
-        upgrade_user_app_installation(user_id, inst_id)
-        logger.info(f"[TEAMS] Upgrade solicitado para instalação {inst_id}.")
-        # espera alguns segundos para refletir
-        time.sleep(5)
-    except TeamsGraphError as e:
-        # alguns tenants respondem 400 se já está na última versão — prossegue
-        logger.warning(f"[TEAMS] Upgrade não aplicado (pode já estar na última): {e}")
+        t = _token()
+        # tenta pegar dados mínimos da organização só para validar o token
+        r = _g("GET", f"{GRAPH}/organization?$select=id,displayName", t)
+        org = None
+        if r.status_code == 200 and r.json().get("value"):
+            org = r.json()["value"][0]
+        return {
+            "tenant_id": TENANT_ID,
+            "client_id": CLIENT_ID[:6] + "…" if CLIENT_ID else None,
+            "scopes": "Graph /.default",
+            "org": org,
+            "ok": True,
+        }
+    except Exception as e:
+        return {
+            "tenant_id": TENANT_ID,
+            "client_id": CLIENT_ID[:6] + "…" if CLIENT_ID else None,
+            "error": str(e),
+            "ok": False,
+        }
 
-def send_activity_notification_to_user(user_id: str, ticket_id: int, subject: str):
-    token = _get_app_token()
-    catalog_id = _resolve_catalog_app_id(token)  # necessário p/ deeplink
-    url = f"{GRAPH}/users/{user_id}/teamwork/sendActivityNotification"
 
-    topic_web_url = _build_teams_deeplink_to_app(catalog_id, ticket_id)
+def diag_resolve_app() -> Dict[str, Any]:
+    """
+    Compat com versões antigas: antes havia um 'app catalog'. Nesta abordagem
+    usamos chat 1:1 direto, então não há catálogo a resolver.
+    """
+    try:
+        _ = _token()  # valida credenciais
+        return {
+            "ok": True,
+            "mode": "direct_chat",
+            "note": "Usando chat 1:1 via Graph; catálogo de app não é necessário.",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-    body = {
-        "topic": {
-            "source": "text",
-            "value": f"Ticket {ticket_id} - {subject[:180]}",
-            "webUrl": topic_web_url
-        },
-        "activityType": "ticketTriagem",
-        "previewText": { "content": f"Olá! Recebi seu chamado #{ticket_id}. Posso te guiar agora." },
-        "templateParameters": [
-            {"name": "ticketId", "value": str(ticket_id)},
-            {"name": "subject", "value": subject or ""}
-        ]
-    }
 
-    r = _g("POST", url, token, json=body, timeout=30)
-    if r.status_code not in (200, 202, 204):
-        raise TeamsGraphError(f"Enviar notificação falhou: {r.status_code} {r.text}")
+def diag_user(email: str) -> Dict[str, Any]:
+    """
+    Retorna dados essenciais do usuário (id, UPN, displayName, mail, enabled).
+    """
+    t = _token()
+    # tenta por mail
+    r1 = _g("GET", f"{GRAPH}/users?$filter=mail eq '{email}'", t)
+    if r1.status_code == 200:
+        v = r1.json().get("value", [])
+        if v:
+            u = v[0]
+            return {
+                "ok": True,
+                "id": u.get("id"),
+                "userPrincipalName": u.get("userPrincipalName"),
+                "displayName": u.get("displayName"),
+                "mail": u.get("mail"),
+                "accountEnabled": u.get("accountEnabled"),
+            }
+    # tenta por UPN (email como UPN)
+    r2 = _g("GET", f"{GRAPH}/users/{email}", t)
+    if r2.status_code == 200:
+        u = r2.json()
+        return {
+            "ok": True,
+            "id": u.get("id"),
+            "userPrincipalName": u.get("userPrincipalName"),
+            "displayName": u.get("displayName"),
+            "mail": u.get("mail"),
+            "accountEnabled": u.get("accountEnabled"),
+        }
+    return {"ok": False, "error": f"Usuário não encontrado para {email}", "status": r2.status_code}
 
-def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str):
+
+def diag_user_installed_apps(email: str) -> Dict[str, Any]:
+    """
+    Lista (quando permitido) os apps instalados para o usuário.
+    Requer permissões específicas. Se 403/404, retorna erro amigável (não lança).
+    """
+    t = _token()
+    # obter id
+    uid = get_user_id_by_mail(email)
+    if not uid:
+        return {"ok": False, "error": f"Usuário não encontrado para {email}"}
+
+    # endpoint de installed apps do usuário
+    # Doc: GET /users/{id}/teamwork/installedApps?$expand=teamsApp
+    url = f"{GRAPH}/users/{uid}/teamwork/installedApps?$expand=teamsApp"
+    r = _g("GET", url, t)
+    if r.status_code == 200:
+        vals = r.json().get("value", [])
+        apps = []
+        for it in vals:
+            app = (it.get("teamsApp") or {})
+            apps.append({"id": app.get("id"), "displayName": app.get("displayName")})
+        return {"ok": True, "count": len(apps), "apps": apps}
+    else:
+        return {
+            "ok": False,
+            "status": r.status_code,
+            "error": r.text,
+            "hint": "Verifique permissões de aplicação: TeamsAppInstallation.ReadForUser.All",
+        }
+
+
+def ensure_app_installed_and_current(user_id: str, wait_seconds: int = 0, interval: float = 0.0) -> None:
+    """
+    Stub compatível com versões antigas do código.
+    Como estamos enviando mensagem 1:1 por chat, não é necessário instalar App personalizada.
+    """
+    return None
+
+
+def send_activity_notification_to_user(user_id: str, ticket_id: int, subject: str, preview_text: Optional[str] = None):
+    """
+    Compatibilidade com chamadas antigas de 'activity notification':
+    aqui enviamos uma mensagem de chat 1:1 com o mesmo texto.
+    """
+    text = preview_text or f"Olá! Recebemos seu chamado #{ticket_id} sobre \"{subject}\". Podemos iniciar o atendimento agora?"
+    t = _token()
+    chat_id = _get_or_create_one_on_one_chat(user_id, t)
+    _send_chat_message(chat_id, text, t)
+
+
+# ---------------- API pública principal ----------------
+
+def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str, preview_text: Optional[str] = None) -> None:
+    """
+    Envia uma mensagem proativa 1:1 no Teams para o usuário do e-mail informado.
+    """
+    text = preview_text or f"Olá! Recebemos seu chamado #{ticket_id} sobre \"{subject}\". Podemos iniciar o atendimento agora?"
+    token = _token()
     user = get_user_by_email(user_email)
     user_id = user.get("id")
     if not user_id:
-        raise TeamsGraphError("user_id não encontrado no Graph")
+        raise TeamsGraphError(f"Usuário não encontrado no Graph para: {user_email}")
 
-    # garante instalado e versão corrente (evita 403 “not authorized / expected app”)
-    ensure_app_installed_and_current(user_id, wait_seconds=120, interval=3.0)
+    # Compat: algumas versões pedem "instalar app". Aqui é no-op.
+    ensure_app_installed_and_current(user_id, wait_seconds=0, interval=0.0)
 
-    send_activity_notification_to_user(user_id, ticket_id, subject)
+    chat_id = _get_or_create_one_on_one_chat(user_id, token)
+    _send_chat_message(chat_id, text, token)
 
-# --------------- diagnósticos ----------------
-def diag_token_info() -> dict:
-    token = _get_app_token()
-    return {"ok": True, "tenant": MS_TENANT_ID, "client_id_suffix": MS_CLIENT_ID[-6:]}
 
-def diag_resolve_app() -> dict:
-    token = _get_app_token()
-    catalog_id = _resolve_catalog_app_id(token)
-    return {"ok": True, "input": TEAMS_APP_ID_ENV, "catalog_id": catalog_id}
-
-def diag_user(email: str) -> dict:
-    u = get_user_by_email(email)
-    return {"ok": True, "id": u.get("id"), "displayName": u.get("displayName"), "mail": u.get("mail") or u.get("userPrincipalName")}
-
-def diag_user_installed_apps(email: str) -> dict:
-    u = get_user_by_email(email)
-    uid = u.get("id")
-    items = list_user_installed_apps(uid)
-    return {"ok": True, "userId": uid, "installed": items}
+def send_proactive_message(user_email: str, text: str) -> bool:
+    """
+    Wrapper simples para enviar mensagem 1:1.
+    """
+    try:
+        token = _token()
+        user = get_user_by_email(user_email)
+        user_id = user.get("id")
+        if not user_id:
+            raise TeamsGraphError(f"Usuário não encontrado: {user_email}")
+        chat_id = _get_or_create_one_on_one_chat(user_id, token)
+        _send_chat_message(chat_id, text, token)
+        return True
+    except Exception:
+        return False

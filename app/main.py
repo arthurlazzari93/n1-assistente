@@ -13,7 +13,7 @@ from loguru import logger
 from pydantic import BaseModel
 from tenacity import RetryError
 
-# --- Windows: usar o event loop compatível
+# --- Windows: usar o event loop compatível (evita warnings/erros no BotBuilder)
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
@@ -21,7 +21,18 @@ if sys.platform.startswith("win"):
         pass
 
 # ---- Módulos do projeto
-from app.db import init_db, upsert_ticket, get_ticket_rec
+from app.db import (
+    init_db,
+    upsert_ticket,
+    get_ticket_rec,
+    schedule_proactive_flow,
+    fetch_due_followups,
+    mark_followup_sent,
+    cancel_followups,
+    connect,
+    mark_teams_notified,
+)
+
 from app.movidesk_client import (
     MovideskError,
     get_ticket_by_id,
@@ -29,24 +40,49 @@ from app.movidesk_client import (
     get_latest_ticket_for_email_account_multi,
     sample_email_channel,
 )
+
+# imports de auditoria (opcionais – não derrubam o app se ausentes)
+try:
+    from app.movidesk_client import list_actions, list_notes  # type: ignore
+except Exception:
+    list_actions = None  # type: ignore
+    list_notes = None  # type: ignore
+
 from app.classifier import classify_from_subject
 from app.llm import classify_ticket_with_llm
 from app.teams_graph import (
     TeamsGraphError,
     notify_user_for_ticket,
+    send_proactive_message,
     diag_token_info,
     diag_resolve_app,
     diag_user,
+    diag_user_installed_apps,
 )
-
 from app import kb
+
+# lazy import: função opcional; evita quebrar a inicialização se o módulo estiver parcial
+try:
+    from app.movidesk_client import add_public_note as _add_public_note  # type: ignore
+except Exception:
+    _add_public_note = None  # type: ignore
+
+# importa de forma robusta (pacote absoluto)
+try:
+    from app.summarizer import summarize_conversation
+except Exception:
+    # fallback simples para não quebrar o endpoint se o módulo faltar
+    def summarize_conversation(text: str) -> str:
+        text = text or ""
+        return (text[:800] + "…") if len(text) > 800 else text
+
 
 load_dotenv()
 
 # -----------------------------------------------------------------------------#
 # App + Logs
 # -----------------------------------------------------------------------------#
-app = FastAPI(title="Assistente N1 - Tecnogera (BOT single-tenant fix)")
+app = FastAPI(title="Assistente N1 - Tecnogera")
 logger.remove()
 logger.add("app.log", rotation="10 MB", retention=5, enqueue=True)
 
@@ -81,14 +117,6 @@ ORIGIN_MAP = {
     9: "Web API",
 }
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "file": __file__}
-
-@app.get("/debug/routes")
-def _debug_routes():
-    return [getattr(r, "path", str(r)) for r in app.router.routes]
-
 def _is_email_channel(ticket: dict) -> bool:
     try:
         return int(ticket.get("origin", 0)) == 3
@@ -116,6 +144,14 @@ def _pick_requester_email(ticket: dict) -> str:
             return e
     return ""
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "file": __file__}
+
+@app.get("/debug/routes")
+def _debug_routes():
+    return [getattr(r, "path", str(r)) for r in app.router.routes]
+
 @app.get("/debug/bot-info")
 def debug_bot_info():
     return {
@@ -123,8 +159,75 @@ def debug_bot_info():
         "MS_CLIENT_ID_present": bool(BOT_APP_ID),
         "MS_CLIENT_SECRET_present": bool(BOT_APP_PASSWORD),
         "MS_TENANT_ID_present": bool(MS_TENANT_ID),
-        "BOT_LOADED": _bot_loaded_ok,
+        "BOT_LOADED": '_bot_loaded_ok' in globals() and bool(_bot_loaded_ok),
     }
+
+# -----------------------------------------------------------------------------#
+# FOLLOW-UPS
+# -----------------------------------------------------------------------------#
+def _followups_already_scheduled(ticket_id: int) -> bool:
+    try:
+        with connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(1) FROM ticket_followups WHERE ticket_id=? AND state='pending';",
+                (ticket_id,),
+            )
+            row = cur.fetchone()
+            return bool(row and row[0] and int(row[0]) > 0)
+    except Exception:
+        return False
+
+def _process_followups_once() -> int:
+    due = fetch_due_followups(limit=50)
+    sent = 0
+    for fu in due:
+        ok = False
+        try:
+            ok = send_proactive_message(fu["requester_email"], fu["message"])
+        except Exception as e:
+            logger.warning(f"[followups] erro ao enviar para {fu['requester_email']}: {e}")
+        if ok:
+            try:
+                mark_followup_sent(fu["id"])
+                sent += 1
+            except Exception as e:
+                logger.warning(f"[followups] falha ao marcar enviado id={fu['id']}: {e}")
+            # registra "rastro" no ticket se a função existir
+            if callable(_add_public_note):
+                try:
+                    _add_public_note(int(fu["ticket_id"]), f"[N1 Bot] {fu['message']}")
+                except Exception as e:
+                    logger.warning(f"[followups] nota pública falhou no ticket {fu['ticket_id']}: {e}")
+            else:
+                logger.warning(f"[followups] add_public_note indisponível; ticket {fu['ticket_id']} ficou sem anotação.")
+    return sent
+
+@app.post("/cron/followups/run")
+def run_followups_now():
+    sent = _process_followups_once()
+    return {"ok": True, "sent": sent}
+
+# Dispara o worker de lembretes quando a aplicação sobe (opcional)
+@app.on_event("startup")
+async def _boot_followups_loop():
+    # garante estrutura do banco
+    try:
+        init_db()
+    except Exception as e:
+        logger.warning(f"[BOOT] init_db falhou (seguindo sem parar): {e}")
+
+    if os.getenv("ENABLE_INPROC_FOLLOWUPS", "0") == "1":
+        async def _loop():
+            interval = int(os.getenv("FOLLOWUP_POLL_SECONDS", "60"))
+            logger.info(f"[FOLLOWUPS] loop ativado (intervalo {interval}s)")
+            while True:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _process_followups_once)
+                except Exception as e:
+                    logger.exception(f"[FOLLOWUPS] erro no loop: {e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(_loop())
 
 # -----------------------------------------------------------------------------#
 # BOT: carregamento seguro (sempre registra /api/messages)
@@ -141,12 +244,10 @@ if ENABLE_TEAMS_BOT:
         from botbuilder.schema import Activity
         from app.bot import N1Bot  # precisa de app/bot.py e app/__init__.py
 
-        # >>> FIX CRÍTICO PARA SINGLE-TENANT <<<
-        # Canal de autenticação deve usar SEU tenant quando o App é single-tenant
         adapter_settings = BotFrameworkAdapterSettings(
             app_id=BOT_APP_ID,
             app_password=BOT_APP_PASSWORD,
-            channel_auth_tenant=MS_TENANT_ID or None,  # se vazio, cai no default botframework.com
+            channel_auth_tenant=MS_TENANT_ID or None,
         )
 
         bot_adapter = BotFrameworkAdapter(adapter_settings)
@@ -178,7 +279,6 @@ if ENABLE_TEAMS_BOT:
                 await conversation_state.save_changes(turn_context)
 
             try:
-                # timeout para evitar pendurar se metadata/JWKS estiver bloqueado
                 await asyncio.wait_for(
                     bot_adapter.process_activity(activity, auth_header, aux),
                     timeout=15,
@@ -206,7 +306,10 @@ if not _bot_loaded_ok:
 # Ingestão Movidesk + Classificação
 # -----------------------------------------------------------------------------#
 @app.post("/ingest/movidesk")
-async def ingest_movidesk(request: Request, t: str = Query(..., description="segredo do webhook")):
+async def ingest_movidesk(
+    request: Request,
+    t: str = Query(..., description="segredo do webhook"),
+):
     if not WEBHOOK_SHARED_SECRET or t != WEBHOOK_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Segredo inválido")
 
@@ -236,6 +339,7 @@ async def ingest_movidesk(request: Request, t: str = Query(..., description="seg
     matches_account = _email_to_matches(ticket)
     allowed = bool(is_email and matches_account)
 
+    # tenta obter texto do primeiro e-mail (ajuda na classificação)
     try:
         bundle = get_ticket_text_bundle(ticket_id)
     except Exception as e:
@@ -259,33 +363,34 @@ async def ingest_movidesk(request: Request, t: str = Query(..., description="seg
             if OPENAI_API_KEY:
                 llm = classify_ticket_with_llm(subj, body_for_llm)
                 llm_obj = llm.model_dump()
-                n1_candidate = bool(llm.n1_candidate and not llm.admin_required and (llm.confidence or 0) >= 0.5)
-                n1_reason = f"LLM: {llm.rationale or 'sem rationale'}"
+                n1_candidate = bool(llm.n1_candidate and not llm.admin_required and (llm.confidence or 0) >= 0.55)
+                n1_reason = llm.reason or "—"
+                llm_conf = llm.confidence
+                llm_admin = bool(llm.admin_required)
                 suggested_service = llm.suggested_service
                 suggested_category = llm.suggested_category
                 suggested_urgency = llm.suggested_urgency or "Média"
-                llm_conf = llm.confidence
-                llm_admin = bool(llm.admin_required)
             else:
-                cls = classify_from_subject(subj)
-                n1_candidate = cls.n1_candidate
-                n1_reason = f"Fallback regras: {cls.n1_reason}"
-                suggested_service = cls.suggested_service
-                suggested_category = cls.suggested_category
-                suggested_urgency = cls.suggested_urgency
+                clf = classify_from_subject(subj)
+                n1_candidate = bool(clf.auto_solve)
+                n1_reason = f"[fallback] {clf.reason}"
+                suggested_service = clf.service
+                suggested_category = clf.category
+                suggested_urgency = clf.urgency or "Média"
         except Exception as e:
-            logger.error(f"[INGEST] LLM/regras falhou ({ticket_id}): {e}\n{traceback.format_exc()}")
-            cls = classify_from_subject(subj)
-            n1_candidate = cls.n1_candidate
-            n1_reason = f"Fallback regras (erro LLM): {cls.n1_reason}"
-            suggested_service = cls.suggested_service
-            suggested_category = cls.suggested_category
-            suggested_urgency = cls.suggested_urgency
+            logger.warning(f"[INGEST] falha na classificação com LLM: {e}")
+            clf = classify_from_subject(subj)
+            n1_candidate = bool(clf.auto_solve)
+            n1_reason = f"[fallback] {clf.reason}"
+            suggested_service = clf.service
+            suggested_category = clf.category
+            suggested_urgency = clf.urgency or "Média"
 
+    # upsert no banco para debug/consulta futura
     upsert_ticket(
         ticket_id=ticket_id,
         allowed=allowed,
-        subject=subj,
+        subject=subj or subject or f"Ticket #{ticket_id}",
         requester_email=requester_email,
         origin_email_account=origin_email_account,
         n1_candidate=n1_candidate,
@@ -293,97 +398,92 @@ async def ingest_movidesk(request: Request, t: str = Query(..., description="seg
         suggested_service=suggested_service,
         suggested_category=suggested_category,
         suggested_urgency=suggested_urgency,
-        llm_json=llm_obj,
         llm_confidence=llm_conf,
-        llm_admin_required=llm_admin,
+        llm_admin_required=int(llm_admin),
     )
+
+    # Notifica proativamente no Teams e agenda lembretes
+    notified = False
+    if ENABLE_TEAMS_BOT and allowed and requester_email:
+        try:
+            preview = f"Olá! Recebemos seu chamado #{ticket_id} sobre \"{subj or subject}\". Podemos iniciar o atendimento agora?"
+            notify_user_for_ticket(requester_email, ticket_id, subj or f"Ticket #{ticket_id}", preview_text=preview)
+            notified = True
+
+            try:
+                mark_teams_notified(ticket_id)
+            except Exception as e:
+                logger.warning(f"[INGEST] não consegui marcar teams_notified: {e}")
+
+            try:
+                if not _followups_already_scheduled(ticket_id):
+                    schedule_proactive_flow(ticket_id, requester_email, subj or subject or f"Ticket #{ticket_id}")
+            except Exception as e:
+                logger.warning(f"[INGEST] não consegui agendar followups do ticket {ticket_id}: {e}")
+
+        except TeamsGraphError as e:
+            logger.warning(f"[TEAMS] falha ao notificar usuário {requester_email} para ticket {ticket_id}: {e}")
 
     return {
         "ok": True,
-        "ticketId": ticket_id,
-        "allowed": allowed,
-        "origin": {"code": origin_code, "name": origin_name},
-        "originEmailAccount": origin_email_account,
-        "requesterEmail": requester_email,
-        "subject": subj,
-        "classification": {
-            "n1_candidate": n1_candidate,
-            "n1_reason": n1_reason,
-            "suggested_service": suggested_service,
-            "suggested_category": suggested_category,
-            "suggested_urgency": suggested_urgency,
-            "llm_confidence": llm_conf,
-            "llm_admin_required": llm_admin,
-            "llm_raw": llm_obj,
+        "ticket": {
+            "id": ticket_id,
+            "origin": origin_name,
+            "originEmailAccount": origin_email_account,
+            "subject": subj or subject,
+            "requester_email": requester_email,
         },
+        "allowed": allowed,
+        "n1_candidate": n1_candidate,
+        "n1_reason": n1_reason,
+        "suggested": {
+            "service": suggested_service,
+            "category": suggested_category,
+            "urgency": suggested_urgency,
+        },
+        "notified_on_teams": notified,
+        "llm_used": bool(OPENAI_API_KEY),
+        "llm_obj": llm_obj or {},
     }
 
 # -----------------------------------------------------------------------------#
-# Debug Movidesk / Base
+# Amostragem / utilitários Movidesk
 # -----------------------------------------------------------------------------#
-@app.get("/debug/ticket-text")
-def debug_ticket_text(id: int):
-    try:
-        return get_ticket_text_bundle(id)
-    except (RetryError, MovideskError) as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
 @app.get("/debug/check")
 def debug_check(id: int):
     try:
-        ticket = get_ticket_by_id(id)
+        t = get_ticket_by_id(id)
     except (RetryError, MovideskError) as e:
         raise HTTPException(status_code=502, detail=str(e))
-    origin_code = ticket.get("origin")
-    origin_name = ORIGIN_MAP.get(origin_code, str(origin_code))
-    origin_email_account = ticket.get("originEmailAccount") or ""
-    is_email = _is_email_channel(ticket)
-    matches_account = _email_to_matches(ticket)
-    allowed = bool(is_email and matches_account)
     return {
-        "id": ticket.get("id"),
-        "subject": ticket.get("subject"),
-        "origin": {"code": origin_code, "name": origin_name},
-        "originEmailAccount": origin_email_account,
-        "allowEmailToEnv": ALLOW_EMAIL_TO_LIST,
-        "allowed": allowed,
-        "checks": {"isEmailChannel": is_email, "emailAccountMatches": matches_account},
+        "id": id,
+        "origin": ORIGIN_MAP.get(t.get("origin"), t.get("origin")),
+        "originEmailAccount": t.get("originEmailAccount"),
+        "subject": t.get("subject"),
+        "owner": t.get("owner"),
+        "clients": t.get("clients"),
+        "isEmail": _is_email_channel(t),
+        "matchesAccount": _email_to_matches(t),
     }
+
+@app.get("/debug/ticket-text")
+def debug_ticket_text(id: int):
+    try:
+        b = get_ticket_text_bundle(id)
+        return b
+    except (RetryError, MovideskError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 @app.get("/debug/latest-ti")
-def debug_latest_ti():
+def debug_latest_ti(max_take: int = 50):
     try:
-        ticket = get_latest_ticket_for_email_account_multi(ALLOW_EMAIL_TO_LIST)
-    except (RetryError, MovideskError) as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    origin_code = ticket.get("origin")
-    origin_name = ORIGIN_MAP.get(origin_code, str(origin_code))
-    origin_email_account = ticket.get("originEmailAccount") or ""
-    is_email = _is_email_channel(ticket)
-    matches_account = _email_to_matches(ticket)
-    allowed = bool(is_email and matches_account)
-    return {
-        "id": ticket.get("id"),
-        "subject": ticket.get("subject"),
-        "origin": {"code": origin_code, "name": origin_name},
-        "originEmailAccount": origin_email_account,
-        "allowEmailToEnv": ALLOW_EMAIL_TO_LIST,
-        "allowed": allowed,
-        "checks": {"isEmailChannel": is_email, "emailAccountMatches": matches_account},
-    }
-
-@app.get("/debug/peek-accounts")
-def debug_peek_accounts(max: int = 300):
-    try:
-        sample = sample_email_channel(max_items=max)
+        sample = get_latest_ticket_for_email_account_multi(ALLOW_EMAIL_TO_LIST, max_take=max_take)
         counts = {}
-        for s in sample:
-            acc = (s.get("originEmailAccount") or "").strip()
-            if not acc:
-                continue
+        for t in (sample or []):
+            acc = (t.get("originEmailAccount") or "").lower().strip()
             counts[acc] = counts.get(acc, 0) + 1
-        ordered = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-        return {"foundAccounts": [{"originEmailAccount": k, "count": v} for k, v in ordered], "totalSample": len(sample)}
+        ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        return {"byOriginEmailAccount": [{"account": k, "count": v} for k, v in ordered], "totalSample": len(sample)}
     except (RetryError, MovideskError) as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -419,7 +519,6 @@ def debug_ping_teams(body: PingBody, dry: bool = Query(False, description="se tr
         except TeamsGraphError as e:
             raise HTTPException(status_code=502, detail=str(e))
 
-    # não está no banco
     try:
         ticket = get_ticket_by_id(body.id)
     except (RetryError, MovideskError) as e:
@@ -466,27 +565,158 @@ def debug_graph_user(email: str):
     except TeamsGraphError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-@app.get("/debug/graph/user-installed-apps")
-def debug_graph_user_installed_apps(email: str):
-    from app.teams_graph import diag_user_installed_apps
+@app.get("/debug/graph/user-apps")
+def debug_graph_user_apps(email: str):
     try:
         return diag_user_installed_apps(email)
     except TeamsGraphError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-@app.get("/debug/bot-auth-check")
-def debug_bot_auth_check():
-    import httpx
-    urls = [
-        "https://login.botframework.com/v1/.well-known/openidconfiguration",
-        "https://login.botframework.com/v1/.well-known/keys",
-        "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration",
-    ]
-    out = []
-    for u in urls:
+# -----------------------------------------------------------------------------#
+# Resumo -> Movidesk (com verificação de gravação)
+# -----------------------------------------------------------------------------#
+class SummaryBody(BaseModel):
+    id: int
+
+@app.post("/tickets/{ticket_id}/resumo")
+def post_ticket_summary(ticket_id: int, body: SummaryBody):
+    """
+    Sumariza uma conversa (placeholder) e publica nota no ticket.
+    Depois, lê ações/notas para confirmar visualmente a inserção.
+    """
+    try:
+        _ = get_ticket_by_id(ticket_id)
+    except (RetryError, MovideskError) as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao buscar ticket: {e}")
+
+    transcript = f"Interação automática sobre o ticket #{ticket_id}."
+    resumo = summarize_conversation(transcript)
+
+    # garante função (lazy)
+    global _add_public_note
+    if not callable(_add_public_note):
         try:
-            r = httpx.get(u, timeout=8)
-            out.append({"url": u, "status": r.status_code, "ok": r.status_code == 200, "len": len(r.text)})
+            from app.movidesk_client import add_public_note as _add_public_note  # type: ignore
+        except Exception:
+            _add_public_note = None  # type: ignore
+
+    published = False
+    attempt = None
+    err_detail = None
+
+    if not callable(_add_public_note):
+        logger.warning("[resumo] add_public_note indisponível; resumo NÃO publicado no Movidesk.")
+    else:
+        try:
+            result = _add_public_note(ticket_id, resumo)  # type: ignore[misc]
+            attempt = (result or {}).get("attempt")
+            published = bool(result and result.get("ok"))
+        except RetryError as e:
+            inner = getattr(e, "last_attempt", None)
+            inner_exc = inner.exception() if inner else None  # type: ignore[attr-defined]
+            err_detail = str(inner_exc or e)
+            logger.warning(f"[resumo] falha ao publicar nota (RetryError): {err_detail}")
+        except MovideskError as e:
+            err_detail = str(e)
+            logger.warning(f"[resumo] falha ao publicar nota (MovideskError): {err_detail}")
         except Exception as e:
-            out.append({"url": u, "error": str(e)})
-    return {"checks": out}
+            err_detail = f"Erro inesperado: {e}"
+            logger.exception("[resumo] falha inesperada ao publicar nota")
+
+    # Auditoria pós-escrita (se helpers existirem)
+    actions = []
+    notes = []
+    try:
+        if callable(list_actions):
+            actions = list_actions(ticket_id, top=5)  # type: ignore[misc]
+        if callable(list_notes):
+            notes = list_notes(ticket_id, top=5)  # type: ignore[misc]
+    except Exception as e:
+        logger.warning(f"[resumo] auditoria pós-escrita falhou: {e}")
+
+    return {
+        "ok": True,
+        "ticket": ticket_id,
+        "resumo": resumo,
+        "published": published,
+        "attempt": attempt,
+        "error": err_detail,
+        "after_api_check": {
+            "actions_top5": actions,
+            "notes_top5": notes,
+        },
+    }
+
+# -----------------------------------------------------------------------------#
+# Ferramentas de debug Movidesk (validação de escrita/leitura)
+# -----------------------------------------------------------------------------#
+class ActionTestBody(BaseModel):
+    ticket_id: int
+    text: str | None = None
+
+@app.post("/debug/movidesk/action-test")
+def movidesk_action_test(body: ActionTestBody):
+    """
+    Publica uma ação/nota com o texto informado e retorna leitura imediata
+    das ações/notas para ver se persistiu de fato.
+    """
+    txt = (body.text or f"[N1 Bot] Teste automático no ticket #{body.ticket_id}").strip()
+
+    # lazy import p/ garantir em modo --reload
+    global _add_public_note
+    if not callable(_add_public_note):
+        try:
+            from app.movidesk_client import add_public_note as _add_public_note  # type: ignore
+        except Exception:
+            _add_public_note = None  # type: ignore
+
+    if not callable(_add_public_note):
+        raise HTTPException(status_code=500, detail="add_public_note indisponível.")
+
+    result = None
+    try:
+        result = _add_public_note(int(body.ticket_id), txt)  # type: ignore[misc]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao publicar ação/nota: {e}")
+
+    a = []
+    n = []
+    try:
+        if callable(list_actions):
+            a = list_actions(body.ticket_id, top=5)  # type: ignore[misc]
+        if callable(list_notes):
+            n = list_notes(body.ticket_id, top=5)  # type: ignore[misc]
+    except Exception as e:
+        logger.warning(f"[action-test] auditoria falhou: {e}")
+
+    return {
+        "ok": True,
+        "ticket": body.ticket_id,
+        "publish_result": result,
+        "after_api_check": {"actions_top5": a, "notes_top5": n},
+    }
+
+@app.get("/debug/movidesk/audit")
+def movidesk_audit(id: int, top: int = 10):
+    """
+    Apenas lista ações/notas atuais do ticket, sem publicar nada.
+    Útil para visualizar o que a API está retornando na sua base.
+    """
+    a = []
+    n = []
+    try:
+        if callable(list_actions):
+            a = list_actions(id, top=top)  # type: ignore[misc]
+        if callable(list_notes):
+            n = list_notes(id, top=top)  # type: ignore[misc]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Falha na leitura: {e}")
+    return {"ok": True, "ticket": id, "actions": a, "notes": n}
+
+# -----------------------------------------------------------------------------#
+# Cancelamento de followups
+# -----------------------------------------------------------------------------#
+@app.post("/tickets/{ticket_id}/followups/cancel")
+def cancel_followups_api(ticket_id: int):
+    cancel_followups(int(ticket_id))
+    return {"ok": True}

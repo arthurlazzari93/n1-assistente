@@ -1,6 +1,8 @@
 # app/movidesk_client.py
-
 import os
+from http import HTTPStatus
+from typing import List, Dict
+
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
@@ -8,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
+
 
 
 class MovideskError(Exception):
@@ -32,7 +35,7 @@ def _raise_http_error(resp: httpx.Response, context: str):
     )
 
 
-def _ensure_ok(resp: httpx.Response, context: str):
+def _ensure_ok(resp: httpx.Response, context: str) -> bool:
     # 429 -> deixa estourar para o tenacity fazer retry/backoff
     if resp.status_code == 429:
         _raise_http_error(resp, context)
@@ -49,7 +52,7 @@ def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
-def _contains_any(haystack: str, needles: list[str]) -> bool:
+def _contains_any(haystack: str, needles: List[str]) -> bool:
     h = _norm(haystack)
     for n in needles:
         nrm = _norm(n)
@@ -125,7 +128,7 @@ def get_ticket_by_id(ticket_id: int) -> dict:
 
 # ---------------- Listagens para varrer recentes / “último da TI” ----------------
 
-def _list_tickets(path: str, params: dict, context: str) -> list[dict]:
+def _list_tickets(path: str, params: dict, context: str) -> List[dict]:
     token = _get_token()
     headers = {"Accept": "application/json"}
     p = dict(params)
@@ -138,7 +141,7 @@ def _list_tickets(path: str, params: dict, context: str) -> list[dict]:
         return data if isinstance(data, list) else []
 
 
-def _list_recent_batch(limit: int = 100, use_past: bool = False, with_orderby: bool = True, skip: int = 0) -> list[dict]:
+def _list_recent_batch(limit: int = 100, use_past: bool = False, with_orderby: bool = True, skip: int = 0) -> List[dict]:
     """
     Busca um lote de tickets recentes (qualquer canal). Quem chama filtra por origin==3 e por conta.
     """
@@ -159,11 +162,11 @@ def _list_recent_batch(limit: int = 100, use_past: bool = False, with_orderby: b
     return _list_tickets(path, params, f"_list_recent_batch {path} skip={skip}")
 
 
-def sample_email_channel(max_items: int = 300) -> list[dict]:
+def sample_email_channel(max_items: int = 300) -> List[dict]:
     """
     Retorna amostra de tickets com origin==3 para inspecionar originEmailAccount (debug).
     """
-    results: list[dict] = []
+    results: List[dict] = []
     checked = 0
     page_size = 100
 
@@ -201,42 +204,62 @@ def sample_email_channel(max_items: int = 300) -> list[dict]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-def get_latest_ticket_for_email_account_multi(allowed_accounts: list[str]) -> dict:
+def get_latest_ticket_for_email_account_multi(allowed_accounts: List[str], max_take: int = 50) -> List[dict]:
     """
-    Retorna o ticket mais recente com origin==3 e originEmailAccount combinando com alguma conta da lista.
+    Retorna até 'max_take' tickets mais recentes (origin==3) cuja originEmailAccount
+    combine com algum item de 'allowed_accounts'. Mantém ordem recente e remove duplicados.
+    Compatível com /debug/latest-ti.
     """
     allowed_accounts = [a for a in allowed_accounts if a and a.strip()]
     if not allowed_accounts:
         raise MovideskError("Lista de contas vazia para filtro")
 
+    results: List[dict] = []
+    seen_ids: set[int] = set()
+
     checked = 0
     page_size = 100
-    max_items = 1500  # alcance maior para ambientes com muito volume
+    # alcance total proporcional ao que o caller pediu
+    max_items = max(500, max_take * 20)
 
     for use_past in (False, True):
         for with_orderby in (True, False):
             skip = 0
-            while checked < max_items:
+            while checked < max_items and len(results) < max_take:
                 take = min(page_size, max_items - checked)
                 batch = _list_recent_batch(limit=take, use_past=use_past, with_orderby=with_orderby, skip=skip)
                 if not batch:
                     break
+
                 for t in batch:
                     try:
                         if int(t.get("origin", 0)) != 3:
                             continue
                     except Exception:
                         continue
-                    acct = t.get("originEmailAccount") or ""
-                    if _contains_any(acct, allowed_accounts):
-                        return t
+
+                    acc = (t.get("originEmailAccount") or "")
+                    if not _contains_any(acc, allowed_accounts):
+                        continue
+
+                    tid = t.get("id")
+                    if tid in seen_ids:
+                        continue
+                    seen_ids.add(tid)
+                    results.append(t)
+
+                    if len(results) >= max_take:
+                        break
+
                 checked += len(batch)
                 skip += take
 
-    raise MovideskError(
-        f"Nenhum ticket via e-mail encontrado para as contas: {', '.join(allowed_accounts)}. "
-        f"Tente aumentar o alcance ou confirme o valor da conta conforme aparece na API."
-    )
+            if len(results) >= max_take:
+                break
+        if len(results) >= max_take:
+            break
+
+    return results
 
 
 # ---------------- Texto do chamado (assunto + corpo) ----------------
@@ -248,14 +271,6 @@ def get_ticket_text_bundle(ticket_id: int) -> dict:
       - subject
       - first_action_text (texto plano)
       - first_action_html (se disponível)
-
-    Estratégia:
-      A) Sempre tenta pegar "subject" via get_ticket_by_id como fallback inicial.
-      B) /tickets/{id}?$select=id,subject&$expand=actions($orderby=id asc;$top=5)
-      C) /tickets/{id}?$select=id,subject&$expand=actions($top=5)
-      D) /tickets/{id}/actions?$orderby=id asc&$top=5
-      E) /tickets/{id}/actions?$top=5
-      F) /tickets/{id}/htmldescription
     """
     token = _get_token()
     headers = {"Accept": "application/json"}
@@ -278,14 +293,14 @@ def get_ticket_text_bundle(ticket_id: int) -> dict:
     first_text = ""
     first_html = ""
 
-    # Fallback imediato: tenta obter o assunto pela rota “segura”
+    # Fallback imediato: tenta obter o assunto
     try:
         base = get_ticket_by_id(ticket_id)
         subject = base.get("subject") or ""
     except Exception:
         pass
 
-    def _take_from_actions(actions: list[dict]):
+    def _take_from_actions(actions: List[dict]):
         nonlocal first_text, first_html
         for a in actions or []:
             first_html = a.get("htmlDescription") or a.get("description") or ""
@@ -345,3 +360,179 @@ def get_ticket_text_bundle(ticket_id: int) -> dict:
         "first_action_text": first_text,
         "first_action_html": first_html,
     }
+
+
+# ---------------- Ações/Notas públicas + fechamento ----------------
+
+def _ok_response(r: httpx.Response) -> dict:
+    try:
+        data = r.json()
+    except Exception:
+        data = {"status": r.status_code}
+    return data
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def add_public_note(ticket_id: int, note_text: str) -> dict:
+    """
+    Cria uma AÇÃO pública na timeline do ticket.
+    Tenta nas seguintes ordens (todas com ?token=...&id=... na URL):
+      1) POST /tickets  (X-HTTP-Method-Override: PATCH)  -> actions[id=0]
+      2) PATCH /tickets                                  -> actions[id=0]
+      3) POST /tickets/{id}/actions                      -> fallback
+      4) POST /tickets  (Override)                       -> notes[id=0]
+      5) PATCH /tickets                                  -> notes[id=0]
+    """
+    token = _get_token()
+    headers_json = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"token": token, "id": str(int(ticket_id))}
+
+    text = (note_text or "").strip()
+    if not text:
+        raise MovideskError("Texto da nota/ação vazio.")
+
+    def _ok(r: httpx.Response) -> bool:
+        return r.status_code in (HTTPStatus.OK, HTTPStatus.CREATED, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT)
+
+    def _resp(r: httpx.Response) -> dict:
+        try:
+            return r.json()
+        except Exception:
+            return {"status": r.status_code}
+
+    # payload preferencial: ACTION pública
+    body_action = {
+        "actions": [
+            {
+                "id": 0,                   # id=0 => inserir
+                "description": text,
+                "isPublic": True,
+                "isHtmlDescription": False,
+                "origin": 4,               # Gatilho do sistema
+                "type": 1                  # Pública
+            }
+        ]
+    }
+
+    # 1) POST override PATCH /tickets (actions)
+    headers_override = dict(headers_json)
+    headers_override["X-HTTP-Method-Override"] = "PATCH"
+    with httpx.Client(timeout=30, headers=headers_override) as c1:
+        r1 = c1.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_action)
+        if _ok(r1):
+            return {"ok": True, "status": r1.status_code, "attempt": "POST override PATCH /tickets (actions)", "response": _resp(r1)}
+
+    # 2) PATCH /tickets (actions)
+    with httpx.Client(timeout=30, headers=headers_json) as c2:
+        r2 = c2.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_action)
+        if _ok(r2):
+            return {"ok": True, "status": r2.status_code, "attempt": "PATCH /tickets (actions)", "response": _resp(r2)}
+
+    # 3) POST /tickets/{id}/actions (fallback)
+    body_post_action = {
+        "description": text,
+        "isPublic": True,
+        "isHtmlDescription": False,
+        "origin": 4,
+        "type": 1,
+    }
+    with httpx.Client(timeout=30, headers=headers_json) as c3:
+        r3 = c3.post(f"{MOVIDESK_BASE}/tickets/{ticket_id}/actions", params={"token": token}, json=body_post_action)
+        if _ok(r3):
+            return {"ok": True, "status": r3.status_code, "attempt": "POST /tickets/{id}/actions", "response": _resp(r3)}
+
+    # 4) NOTES (override primeiro)
+    body_note = {"notes": [{"id": 0, "description": text, "isPublic": True}]}
+    with httpx.Client(timeout=30, headers=headers_override) as c4:
+        r4 = c4.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body_note)
+        if _ok(r4):
+            return {"ok": True, "status": r4.status_code, "attempt": "POST override PATCH /tickets (notes)", "kind": "note", "response": _resp(r4)}
+
+    # 5) PATCH /tickets (notes)
+    with httpx.Client(timeout=30, headers=headers_json) as c5:
+        r5 = c5.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body_note)
+        if _ok(r5):
+            return {"ok": True, "status": r5.status_code, "attempt": "PATCH /tickets (notes)", "kind": "note", "response": _resp(r5)}
+
+        try:
+            last_detail = r5.text[:1200]
+        except Exception:
+            last_detail = f"HTTP {r5.status_code} (sem corpo)"
+
+    raise MovideskError(
+        f"[tickets] Falha ao anexar ação/nota pública no ticket {ticket_id}. Última resposta: {last_detail}"
+    )
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def close_ticket(ticket_id: int, status_name: str = "Resolvido", justification: str | None = None) -> dict:
+    """
+    Ajusta o status via PATCH /tickets (&id na query) ou override por POST,
+    com 'justification' opcional (se sua base exigir motivo).
+    """
+    token = _get_token()
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"token": token, "id": str(int(ticket_id))}
+    body = {"status": status_name}
+    if justification:
+        body["justification"] = justification
+
+    # PATCH direto
+    with httpx.Client(timeout=20, headers=headers) as c1:
+        r1 = c1.patch(f"{MOVIDESK_BASE}/tickets", params=params, json=body)
+        if r1.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT, HTTPStatus.CREATED):
+            return {"ok": True, "status": r1.status_code, "attempt": "PATCH /tickets (status)", "response": _ok_response(r1)}
+
+    # Override (POST com X-HTTP-Method-Override: PATCH)
+    headers2 = dict(headers)
+    headers2["X-HTTP-Method-Override"] = "PATCH"
+    with httpx.Client(timeout=20, headers=headers2) as c2:
+        r2 = c2.post(f"{MOVIDESK_BASE}/tickets", params=params, json=body)
+        if r2.status_code in (HTTPStatus.OK, HTTPStatus.ACCEPTED, HTTPStatus.NO_CONTENT, HTTPStatus.CREATED):
+            return {"ok": True, "status": r2.status_code, "attempt": "POST override PATCH /tickets (status)", "response": _ok_response(r2)}
+
+    _raise_http_error(r1, "tickets (close_ticket)")
+
+
+# ---------------- Utilitários de auditoria ----------------
+
+def list_actions(ticket_id: int, top: int = 10) -> List[dict]:
+    token = _get_token()
+    headers = {"Accept": "application/json"}
+    with httpx.Client(timeout=20, headers=headers) as client:
+        r = client.get(
+            f"{MOVIDESK_BASE}/tickets/{ticket_id}/actions",
+            params={"token": token, "$orderby": "id desc", "$top": top},
+        )
+        if not _ensure_ok(r, "tickets/{id}/actions"):
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+
+
+def list_actions_expand(ticket_id: int, top: int = 10) -> List[dict]:
+    token = _get_token()
+    headers = {"Accept": "application/json"}
+    with httpx.Client(timeout=20, headers=headers) as client:
+        r = client.get(
+            f"{MOVIDESK_BASE}/tickets/{ticket_id}",
+            params={"token": token, "$select": "id", "$expand": f"actions($orderby=id desc;$top={top})"},
+        )
+        if not _ensure_ok(r, "tickets/{id} expand actions"):
+            return []
+        data = r.json() or {}
+        return data.get("actions") or []
+
+
+def list_notes(ticket_id: int, top: int = 10) -> List[dict]:
+    token = _get_token()
+    headers = {"Accept": "application/json"}
+    with httpx.Client(timeout=20, headers=headers) as client:
+        r = client.get(
+            f"{MOVIDESK_BASE}/tickets/{ticket_id}",
+            params={"token": token, "$select": "id", "$expand": f"notes($orderby=id desc;$top={top})"},
+        )
+        if not _ensure_ok(r, "tickets/{id} expand notes"):
+            return []
+        data = r.json() or {}
+        return data.get("notes") or []
