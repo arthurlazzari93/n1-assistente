@@ -12,6 +12,7 @@ from fastapi.responses import Response
 from loguru import logger
 from pydantic import BaseModel
 from tenacity import RetryError
+from app.teams_graph import diag_bot_token
 
 # --- Windows: usar o event loop compatível (evita warnings/erros no BotBuilder)
 if sys.platform.startswith("win"):
@@ -143,6 +144,46 @@ def _pick_requester_email(ticket: dict) -> str:
         if e:
             return e
     return ""
+
+def _get_first(obj, *names, default=None):
+    """Lê um atributo/chave com nomes alternativos, em BaseModel, dict ou objeto comum."""
+    for n in names:
+        # Pydantic v2: model_fields / model_dump
+        if hasattr(obj, n):
+            try:
+                v = getattr(obj, n)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        if isinstance(obj, dict) and n in obj and obj[n] is not None:
+            return obj[n]
+    return default
+
+def _to_dict_safe(obj):
+    """Serializa qq objeto para dict (p/ logging/resposta)."""
+    try:
+        # Pydantic v2
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+    except Exception:
+        pass
+    try:
+        # Pydantic v1
+        if hasattr(obj, "dict"):
+            return obj.dict()
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return obj
+    try:
+        return {k: v for k, v in vars(obj).items() if not callable(v) and not k.startswith("_")}
+    except Exception:
+        return {"_repr": repr(obj)}
+
+@app.get("/debug/bot/token")
+def debug_bot_token():
+    return diag_bot_token()
 
 @app.get("/healthz")
 def healthz():
@@ -310,9 +351,45 @@ async def ingest_movidesk(
     request: Request,
     t: str = Query(..., description="segredo do webhook"),
 ):
+    # --- helpers locais (auto-contidos) ---
+    def _get_first(obj, *names, default=None):
+        """Lê um atributo/chave com nomes alternativos em BaseModel, dict ou objeto simples."""
+        for n in names:
+            if hasattr(obj, n):
+                try:
+                    v = getattr(obj, n)
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+            if isinstance(obj, dict) and n in obj and obj[n] is not None:
+                return obj[n]
+        return default
+
+    def _to_dict_safe(obj):
+        """Serializa qualquer objeto para dict (p/ logging/resposta)."""
+        try:
+            if hasattr(obj, "model_dump"):
+                return obj.model_dump()
+        except Exception:
+            pass
+        try:
+            if hasattr(obj, "dict"):
+                return obj.dict()
+        except Exception:
+            pass
+        if isinstance(obj, dict):
+            return obj
+        try:
+            return {k: v for k, v in vars(obj).items() if not callable(v) and not k.startswith("_")}
+        except Exception:
+            return {"_repr": repr(obj)}
+
+    # --- auth do webhook ---
     if not WEBHOOK_SHARED_SECRET or t != WEBHOOK_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Segredo inválido")
 
+    # --- payload ---
     try:
         payload = await request.json()
     except Exception:
@@ -324,6 +401,7 @@ async def ingest_movidesk(
 
     logger.info(f"[INGEST] payload recebido para ticket {ticket_id}: {payload}")
 
+    # --- ticket base ---
     try:
         ticket = get_ticket_by_id(ticket_id)
     except (RetryError, MovideskError) as e:
@@ -339,7 +417,7 @@ async def ingest_movidesk(
     matches_account = _email_to_matches(ticket)
     allowed = bool(is_email and matches_account)
 
-    # tenta obter texto do primeiro e-mail (ajuda na classificação)
+    # --- conteúdo para classificar ---
     try:
         bundle = get_ticket_text_bundle(ticket_id)
     except Exception as e:
@@ -350,6 +428,7 @@ async def ingest_movidesk(
     body_text = (bundle.get("first_action_text") or "").strip()
     body_for_llm = body_text if body_text else f"(sem corpo; classificar pelo assunto) {subj}"
 
+    # --------------------------- Classificação (robusta a esquemas) ---------------------------
     llm_obj = None
     n1_candidate = False
     n1_reason = "Sem análise"
@@ -362,31 +441,51 @@ async def ingest_movidesk(
         try:
             if OPENAI_API_KEY:
                 llm = classify_ticket_with_llm(subj, body_for_llm)
-                llm_obj = llm.model_dump()
-                n1_candidate = bool(llm.n1_candidate and not llm.admin_required and (llm.confidence or 0) >= 0.55)
-                n1_reason = llm.reason or "—"
-                llm_conf = llm.confidence
-                llm_admin = bool(llm.admin_required)
-                suggested_service = llm.suggested_service
-                suggested_category = llm.suggested_category
-                suggested_urgency = llm.suggested_urgency or "Média"
+
+                llm_obj = _to_dict_safe(llm)
+                llm_conf = _get_first(llm, "confidence", "score", default=None)
+                llm_admin = bool(_get_first(llm, "admin_required", "needs_admin", "admin", default=False))
+                raw_candidate = _get_first(llm, "n1_candidate", "auto_solve", "auto", "is_n1_candidate", default=False)
+                n1_reason = _get_first(llm, "reason", "why", "explanation", "rationale", default="—")
+                suggested_service = _get_first(llm, "suggested_service", "service", default=None)
+                suggested_category = _get_first(llm, "suggested_category", "category", default=None)
+                suggested_urgency = _get_first(llm, "suggested_urgency", "urgency", default="Média")
+
+                # regra: só considera candidato se não exigir admin; se tiver confidence, aplica threshold
+                if llm_conf is None:
+                    n1_candidate = bool(raw_candidate and not llm_admin)
+                else:
+                    try:
+                        n1_candidate = bool(raw_candidate and not llm_admin and float(llm_conf) >= 0.55)
+                    except Exception:
+                        n1_candidate = bool(raw_candidate and not llm_admin)
             else:
                 clf = classify_from_subject(subj)
-                n1_candidate = bool(clf.auto_solve)
-                n1_reason = f"[fallback] {clf.reason}"
-                suggested_service = clf.service
-                suggested_category = clf.category
-                suggested_urgency = clf.urgency or "Média"
+                raw_candidate = _get_first(clf, "auto_solve", "auto", "n1_candidate", default=False)
+                reason_fb = _get_first(clf, "reason", "why", "explanation", default="—")
+                n1_candidate = bool(raw_candidate)
+                n1_reason = f"[fallback] {reason_fb}"
+                suggested_service = _get_first(clf, "service", "suggested_service", default=None)
+                suggested_category = _get_first(clf, "category", "suggested_category", default=None)
+                suggested_urgency = _get_first(clf, "urgency", "suggested_urgency", default="Média")
         except Exception as e:
-            logger.warning(f"[INGEST] falha na classificação com LLM: {e}")
-            clf = classify_from_subject(subj)
-            n1_candidate = bool(clf.auto_solve)
-            n1_reason = f"[fallback] {clf.reason}"
-            suggested_service = clf.service
-            suggested_category = clf.category
-            suggested_urgency = clf.urgency or "Média"
+            logger.warning(f"[INGEST] falha na classificação: {e}")
+            try:
+                clf = classify_from_subject(subj)
+                raw_candidate = _get_first(clf, "auto_solve", "auto", "n1_candidate", default=False)
+                reason_fb = _get_first(clf, "reason", "why", "explanation", default="—")
+                n1_candidate = bool(raw_candidate)
+                n1_reason = f"[fallback] {reason_fb}"
+                suggested_service = _get_first(clf, "service", "suggested_service", default=None)
+                suggested_category = _get_first(clf, "category", "suggested_category", default=None)
+                suggested_urgency = _get_first(clf, "urgency", "suggested_urgency", default="Média")
+            except Exception as e2:
+                logger.warning(f"[INGEST] fallback simples também falhou: {e2}")
+                n1_candidate = False
+                n1_reason = "[erro] classificação indisponível"
+                suggested_urgency = "Média"
 
-    # upsert no banco para debug/consulta futura
+    # --- persistência p/ auditoria ---
     upsert_ticket(
         ticket_id=ticket_id,
         allowed=allowed,
@@ -402,7 +501,7 @@ async def ingest_movidesk(
         llm_admin_required=int(llm_admin),
     )
 
-    # Notifica proativamente no Teams e agenda lembretes
+    # --- notificação proativa no Teams + followups ---
     notified = False
     if ENABLE_TEAMS_BOT and allowed and requester_email:
         try:
@@ -424,6 +523,7 @@ async def ingest_movidesk(
         except TeamsGraphError as e:
             logger.warning(f"[TEAMS] falha ao notificar usuário {requester_email} para ticket {ticket_id}: {e}")
 
+    # --- resposta ---
     return {
         "ok": True,
         "ticket": {
@@ -445,6 +545,7 @@ async def ingest_movidesk(
         "llm_used": bool(OPENAI_API_KEY),
         "llm_obj": llm_obj or {},
     }
+
 
 # -----------------------------------------------------------------------------#
 # Amostragem / utilitários Movidesk
