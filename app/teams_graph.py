@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Dict, Any
-
+import asyncio
 import requests
 
 
@@ -337,6 +337,17 @@ async def send_proactive_via_bot(aad_object_id: str, tenant_id: str, text: str) 
     raise TeamsGraphError(f"Falha ao criar/enviar no chat 1:1 do Teams. Último erro: {last_err!r}")
 
 
+def _run_coro_bg(coro) -> None:
+    """
+    Se já estamos dentro de um event loop (ex.: FastAPI), agenda a tarefa.
+    Caso contrário, cria um loop só para esta chamada (CLI, scripts).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
+    else:
+        loop.create_task(coro)
 
 # ---------------- API pública principal ----------------
 
@@ -358,8 +369,8 @@ def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str, previe
     first_name = (user_email.split("@", 1)[0]).split(".")[0].title()
     text = preview_text or f"Olá {first_name}! Recebemos seu chamado #{ticket_id} sobre “{subject}”. Posso ajudar agora?"
 
-    import asyncio
-    asyncio.run(send_proactive_via_bot(user_id, tenant_id, text))
+    # 👇 antes: asyncio.run(...). Agora: seguro em endpoints async.
+    _run_coro_bg(send_proactive_via_bot(user_id, tenant_id, text))
 
 
 def send_proactive_message(user_email: str, text: str) -> bool:

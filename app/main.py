@@ -118,6 +118,44 @@ ORIGIN_MAP = {
     9: "Web API",
 }
 
+_NOTIFIED_TICKETS = set()  # tickets já notificados (somente em memória)
+
+def extract_core_fields(ticket_id: int) -> dict:
+    """
+    Extrai e padroniza os campos essenciais que o sistema usa:
+    - requester_email (solicitante)
+    - ticket_id
+    - origin_email_account (e-mail de recebimento, ex.: suporte@tecnogera.com.br)
+    - subject
+    - first_action_text (descrição inicial do problema)
+    """
+    # Busca o ticket completo na API Movidesk
+    ticket = get_ticket_by_id(ticket_id)  # pode levantar MovideskError/RetryError
+
+    # Campos base
+    origin_email_account = ticket.get("originEmailAccount") or ""
+    subject = ticket.get("subject") or ""
+
+    # Solicitante: dono/clients do ticket
+    requester_email = _pick_requester_email(ticket) or ""
+
+    # Primeira ação (descrição do usuário)
+    try:
+        bundle = get_ticket_text_bundle(ticket_id)  # {subject, first_action_text, first_action_html}
+    except Exception:
+        bundle = {"subject": subject, "first_action_text": "", "first_action_html": ""}
+
+    first_action_text = (bundle.get("first_action_text") or "").strip()
+
+    return {
+        "ticket_id": int(ticket_id),
+        "requester_email": requester_email,
+        "origin_email_account": origin_email_account,
+        "subject": subject,
+        "first_action_text": first_action_text,
+    }
+
+
 def _is_email_channel(ticket: dict) -> bool:
     try:
         return int(ticket.get("origin", 0)) == 3
@@ -274,6 +312,8 @@ async def _boot_followups_loop():
 # BOT: carregamento seguro (sempre registra /api/messages)
 # -----------------------------------------------------------------------------#
 _bot_loaded_ok = False
+_bot_boot_error = None
+
 if ENABLE_TEAMS_BOT:
     try:
         from botbuilder.core import (
@@ -283,26 +323,35 @@ if ENABLE_TEAMS_BOT:
             MemoryStorage,
         )
         from botbuilder.schema import Activity
-        from app.bot import N1Bot  # precisa de app/bot.py e app/__init__.py
+        from app.bot import N1Bot
+
+        # Validação explícita de credenciais
+        missing = []
+        if not BOT_APP_ID: missing.append("BOT_APP_ID")
+        if not BOT_APP_PASSWORD: missing.append("BOT_APP_PASSWORD")
+        if missing:
+            raise RuntimeError(f"Credenciais ausentes: {', '.join(missing)}")
 
         adapter_settings = BotFrameworkAdapterSettings(
             app_id=BOT_APP_ID,
             app_password=BOT_APP_PASSWORD,
             channel_auth_tenant=MS_TENANT_ID or None,
         )
-
         bot_adapter = BotFrameworkAdapter(adapter_settings)
         memory = MemoryStorage()
         conversation_state = ConversationState(memory)
         bot = N1Bot(conversation_state)
 
-        @app.post("/debug/kb/reindex")
-        def _kb_reindex():
-            return kb.reindex()
-
-        @app.get("/debug/kb/search")
-        def _kb_search(q: str, k: int = 5):
-            return {"results": kb.search(q, k)}
+        @app.get("/debug/bot/health")
+        def bot_health():
+            return {
+                "enabled": True,
+                "_bot_loaded_ok": _bot_loaded_ok,
+                "app_id_present": bool(BOT_APP_ID),
+                "app_password_present": bool(bool(BOT_APP_PASSWORD)),
+                "tenant_id_present": bool(MS_TENANT_ID),
+                "boot_error": _bot_boot_error,
+            }
 
         @app.post("/api/messages")
         async def messages(request: Request):
@@ -310,38 +359,64 @@ if ENABLE_TEAMS_BOT:
             try:
                 body = await request.json()
             except Exception:
-                raise HTTPException(status_code=400, detail="Payload inválido (JSON esperado)")
+                logger.warning("[BOT] payload inválido (não-JSON).")
+                body = {}
 
-            activity = Activity().deserialize(body)
             auth_header = request.headers.get("Authorization", "")
 
+            # tenta desserializar Activity; se falhar, o adapter ainda valida
+            try:
+                activity = Activity().deserialize(body)
+            except Exception:
+                logger.warning("[BOT] falha ao desserializar Activity; passando body cru.")
+                activity = body
+
             async def aux(turn_context):
-                await bot.on_turn(turn_context)
-                await conversation_state.save_changes(turn_context)
+                try:
+                    await bot.on_turn(turn_context)
+                    await conversation_state.save_changes(turn_context)
+                except Exception as e:
+                    logger.exception("[BOT] erro em on_turn: {}", e)
 
             try:
                 await asyncio.wait_for(
                     bot_adapter.process_activity(activity, auth_header, aux),
-                    timeout=15,
+                    timeout=25,
                 )
                 return Response(status_code=201)
             except asyncio.TimeoutError:
-                logger.error("[BOT] process_activity TIMEOUT (checar firewall para *.botframework.com e login.botframework.com)")
-                raise HTTPException(status_code=504, detail="Bot timeout durante validação.")
-            except Exception:
-                logger.exception("[BOT] erro no process_activity")
-                raise HTTPException(status_code=500, detail="Erro interno no bot.")
+                logger.error("[BOT] process_activity TIMEOUT (cheque *.botframework.com / login.botframework.com)")
+                return Response(status_code=200)
+            except Exception as e:
+                logger.exception("[BOT] erro no process_activity: {}", e)
+                return Response(status_code=200)
 
         _bot_loaded_ok = True
         logger.info("[BOOT] Bot do Teams carregado com sucesso (/api/messages).")
+
     except Exception as e:
+        _bot_boot_error = f"{e}"
         logger.error(f"[BOOT] Falha ao inicializar Bot do Teams: {e}\n{traceback.format_exc()}")
 
-# Stub se o bot não carregou (rota existe, mas retorna 503)
+# Stub só se não carregou; nunca 5xx, mas agora loga o motivo
 if not _bot_loaded_ok:
+    @app.get("/debug/bot/health")
+    def bot_health_stub():
+        return {
+            "enabled": ENABLE_TEAMS_BOT,
+            "_bot_loaded_ok": False,
+            "app_id_present": bool(BOT_APP_ID),
+            "app_password_present": bool(bool(BOT_APP_PASSWORD)),
+            "tenant_id_present": bool(MS_TENANT_ID),
+            "boot_error": _bot_boot_error or "não inicializado",
+        }
+
     @app.post("/api/messages")
     async def messages_stub(_: Request):
-        raise HTTPException(status_code=503, detail="Bot indisponível (stub). Verifique dependências/credenciais.")
+        logger.error("[BOOT] Bot indisponível (stub) — verifique dependências/credenciais. Motivo: {}", _bot_boot_error)
+        return Response(status_code=200)
+
+
 
 # -----------------------------------------------------------------------------#
 # Ingestão Movidesk + Classificação
@@ -393,15 +468,52 @@ async def ingest_movidesk(
     try:
         payload = await request.json()
     except Exception:
+        # Movidesk pode mandar form-encoded em alguns eventos
+        try:
+            form = await request.form()
+            if "payload" in form:
+                import json as _json
+                payload = _json.loads(form["payload"])
+            else:
+                raw = (await request.body()).decode("utf-8", "ignore")
+                import json as _json
+                payload = _json.loads(raw) if raw.strip().startswith("{") else {}
+        except Exception:
+            payload = {}
+
+    if not isinstance(payload, dict) or not payload:
         raise HTTPException(status_code=400, detail="Payload inválido (JSON esperado)")
 
-    ticket_id = int(str(payload.get("id") or payload.get("ticketId") or "0"))
+    # aceita Id/id/ticketId/TicketId
+    ticket_id = int(str(
+        payload.get("id")
+        or payload.get("Id")
+        or payload.get("ticketId")
+        or payload.get("TicketId")
+        or "0"
+    ))
     if not ticket_id:
         raise HTTPException(status_code=400, detail="ID do ticket ausente no payload")
 
     logger.info(f"[INGEST] payload recebido para ticket {ticket_id}: {payload}")
 
-    # --- ticket base ---
+    # =========================
+    # TRAVA NA RAIZ (simples)
+    # =========================
+    # Regra 1: só a primeira CRIAÇÃO do ticket (Status="Novo" e ActionCount=1)
+    status = (payload.get("Status") or "").strip().lower()
+    action_count = int(payload.get("ActionCount") or 0)
+    is_first_creation = (status == "novo") and (action_count == 1)
+    if not is_first_creation:
+        # Ignora quaisquer outros eventos (novas ações, reentregas, etc.)
+        return {"ok": True, "skipped": "not-first-creation", "ticket": ticket_id}
+
+    # Regra 2: só uma vez por ticket (não notificar novamente)
+    global _NOTIFIED_TICKETS
+    if ticket_id in _NOTIFIED_TICKETS:
+        return {"ok": True, "skipped": "already-notified", "ticket": ticket_id}
+
+    # --- ticket base (a partir daqui só roda para a 1ª criação e ticket ainda não notificado) ---
     try:
         ticket = get_ticket_by_id(ticket_id)
     except (RetryError, MovideskError) as e:
@@ -411,7 +523,7 @@ async def ingest_movidesk(
     origin_name = ORIGIN_MAP.get(origin_code, str(origin_code))
     origin_email_account = ticket.get("originEmailAccount") or ""
     subject = ticket.get("subject") or ""
-    requester_email = _pick_requester_email(ticket)
+    requester_email = _pick_requester_email(ticket)  # ← sempre usaremos o solicitante
 
     is_email = _is_email_channel(ticket)
     matches_account = _email_to_matches(ticket)
@@ -501,13 +613,17 @@ async def ingest_movidesk(
         llm_admin_required=int(llm_admin),
     )
 
-    # --- notificação proativa no Teams + followups ---
+    # --- notificação proativa no Teams + followups (somente o SOLICITANTE) ---
     notified = False
     if ENABLE_TEAMS_BOT and allowed and requester_email:
         try:
             preview = f"Olá! Recebemos seu chamado #{ticket_id} sobre \"{subj or subject}\". Podemos iniciar o atendimento agora?"
+            # notifica EXCLUSIVAMENTE o e-mail do solicitante
             notify_user_for_ticket(requester_email, ticket_id, subj or f"Ticket #{ticket_id}", preview_text=preview)
             notified = True
+
+            # marca para não notificar novamente este ticket
+            _NOTIFIED_TICKETS.add(ticket_id)
 
             try:
                 mark_teams_notified(ticket_id)
@@ -544,12 +660,28 @@ async def ingest_movidesk(
         "notified_on_teams": notified,
         "llm_used": bool(OPENAI_API_KEY),
         "llm_obj": llm_obj or {},
+        "skipped": None if notified else "already-notified" if ticket_id in _NOTIFIED_TICKETS else None,
     }
-
 
 # -----------------------------------------------------------------------------#
 # Amostragem / utilitários Movidesk
 # -----------------------------------------------------------------------------#
+
+@app.get("/debug/extract-fields")
+def debug_extract_fields(id: int):
+    """
+    Retorna os campos essenciais (solicitante, ticket, e-mail de recebimento, assunto, 1ª ação)
+    para inspeção rápida em testes e troubleshooting.
+    """
+    try:
+        core = extract_core_fields(int(id))
+        return {"ok": True, **core}
+    except (RetryError, MovideskError) as e:
+        raise HTTPException(status_code=502, detail=f"Movidesk: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao extrair campos: {e}")
+
+
 @app.get("/debug/check")
 def debug_check(id: int):
     try:

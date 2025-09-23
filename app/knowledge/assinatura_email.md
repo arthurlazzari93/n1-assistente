@@ -7,6 +7,7 @@ synonyms: [signature, assinatura outlook, assinatura e-mail, assinatura de corre
 # Gerar a assinatura (PNG)
 Abra o Gerador: http://10.246.0.22/sign/  
 Preencha: **Nome, Departamento, Telefone, E-mail, Endereço** → clique **Gerar Assinatura** para baixar o PNG.
+Confirme se a sua solicitação foi atendida
 
 # Outlook Clássico (Win32)
 1. Arquivo → Opções → Email → **Assinaturas…**
@@ -16,6 +17,7 @@ Preencha: **Nome, Departamento, Telefone, E-mail, Endereço** → clique **Gerar
    - **Novas mensagens**: sua assinatura
    - **Respostas/encaminhamentos**: sua assinatura (opcional)
 5. **OK** para salvar.
+6. Confirme se a sua solicitação foi atendida
 
 # Outlook (novo)
 1. Clique na **engrenagem (⚙️)** → **Ver todas as configurações do Outlook**.
@@ -25,3 +27,6 @@ Preencha: **Nome, Departamento, Telefone, E-mail, Endereço** → clique **Gerar
    - **Novas mensagens**: sua assinatura
    - **Respostas/encaminhamentos**: sua assinatura (opcional)
 5. **Salvar**.
+6. Confirme se a sua solicitação foi atendida
+
+
