@@ -1,11 +1,23 @@
 # app/kb.py
 from __future__ import annotations
-import os, re, json, math, unicodedata
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Iterable
-from loguru import logger
 
-# Diretórios
+import json
+import math
+import re
+import unicodedata
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
+
+try:
+    from loguru import logger
+except Exception:  # fallback simples
+    class _L:
+        def info(self, *a, **k): print("[INFO]", *a)
+        def warning(self, *a, **k): print("[WARN]", *a)
+        def error(self, *a, **k): print("[ERROR]", *a)
+    logger = _L()  # type: ignore
+
+# Diretórios/arquivos
 KB_DIR = Path(__file__).parent / "knowledge"
 KB_INDEX = Path(__file__).parent / "kb_index.json"
 
@@ -13,10 +25,10 @@ KB_INDEX = Path(__file__).parent / "kb_index.json"
 K1 = 1.5
 B = 0.75
 
-# Pesos de campos (boosts)
-TITLE_BOOST = 3        # título tem mais peso
-TAGS_BOOST = 2         # tags
-SYN_BOOST = 2          # sinônimos/aliases do doc
+# Boosts de campos
+TITLE_BOOST = 3        # título pesa mais
+TAGS_BOOST = 2         # tags ajudam recall
+SYN_BOOST = 2          # sinônimos/aliases ajudam recall
 
 # Estado em memória
 _DOCS: List[Dict[str, Any]] = []          # [{id, path, title, tags, synonyms, text}]
@@ -24,22 +36,25 @@ _CHUNKS: List[Dict[str, Any]] = []        # [{id, doc_id, text, tokens, tf, len}
 _IDF: Dict[str, float] = {}
 _AVGDL: float = 1.0
 _DOC_BY_ID: Dict[int, Dict[str, Any]] = {}
-# índice global de sinônimos: token -> {sin1, sin2, ...}
-_SYN_INDEX: Dict[str, set] = {}
+_SYN_INDEX: Dict[str, set] = {}           # token -> {sinônimos}
 
-# ----------------- util -----------------
+# --------------------------------------------------------------------------------------
+# Utils
+# --------------------------------------------------------------------------------------
 
 def _strip_accents(text: str) -> str:
-    # normaliza acentos para melhorar match (assinatura == assinatura)
-    nfkd = unicodedata.normalize("NFKD", text)
+    nfkd = unicodedata.normalize("NFKD", text or "")
     return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
 
+def _norm(text: str) -> str:
+    text = _strip_accents(text.lower().strip())
+    text = re.sub(r"\s+", " ", text)
+    return text
+
 def _tokenize(text: str) -> List[str]:
-    text = _strip_accents(text.lower())
-    return re.findall(r"[a-z0-9]+", text)
+    return re.findall(r"[a-z0-9]+", _norm(text))
 
 def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
-    # front-matter simples: linhas "key: value" entre --- e ---
     if raw.startswith("---"):
         try:
             end = raw.index("\n---", 3)
@@ -50,19 +65,19 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
                 if ":" in line:
                     k, v = line.split(":", 1)
                     meta[k.strip().lower()] = v.strip()
-            # arrays simples no estilo [a, b]
             def _to_list(v: Any) -> List[str]:
                 if isinstance(v, list):
                     return [str(x).strip() for x in v]
-                if isinstance(v, str) and v.strip().startswith("["):
-                    return [s.strip(" []") for s in v.split(",")]
                 if isinstance(v, str) and v.strip():
-                    # permite 'a; b; c' ou 'a, b, c'
-                    if ";" in v:
-                        return [x.strip() for x in v.split(";")]
-                    if "," in v:
-                        return [x.strip() for x in v.split(",")]
-                    return [v.strip()]
+                    s = v.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        parts = [p.strip(" []") for p in s.split(",")]
+                        return [p for p in parts if p]
+                    if ";" in s:
+                        return [p.strip() for p in s.split(";")]
+                    if "," in s:
+                        return [p.strip() for p in s.split(",")]
+                    return [s]
                 return []
             meta["tags"] = _to_list(meta.get("tags", []))
             meta["synonyms"] = _to_list(meta.get("synonyms", []))
@@ -72,8 +87,7 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
     return {}, raw
 
 def _split_chunks(text: str, target_words: int = 120) -> List[str]:
-    # quebra por seções e parágrafos, mantendo blocos ~120 palavras
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    paras = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
     chunks, curr, count = [], [], 0
     for p in paras:
         w = len(p.split())
@@ -84,13 +98,14 @@ def _split_chunks(text: str, target_words: int = 120) -> List[str]:
         count += w
     if curr:
         chunks.append("\n\n".join(curr))
-    return chunks
+    return chunks or ([text.strip()] if text else [])
 
 def _ensure_kb_dir():
-    if not KB_DIR.exists():
-        KB_DIR.mkdir(parents=True, exist_ok=True)
+    KB_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------- indexação -----------------
+# --------------------------------------------------------------------------------------
+# Indexação
+# --------------------------------------------------------------------------------------
 
 def _build_index() -> None:
     global _DOCS, _CHUNKS, _IDF, _AVGDL, _DOC_BY_ID, _SYN_INDEX
@@ -112,36 +127,33 @@ def _build_index() -> None:
         _DOCS.append(doc)
         _DOC_BY_ID[doc_id] = doc
 
-        # popula índice global de sinônimos
-        for s in syns:
-            tok = _tokenize(s)
-            for t in tok:
-                _SYN_INDEX.setdefault(t, set()).update(tok)  # cada token “conhece” os irmãos
-        for t in tags:
-            tok = _tokenize(t)
-            for x in tok:
-                _SYN_INDEX.setdefault(x, set()).update(tok)
+        # índice de sinônimos global
+        for ent in (syns + tags):
+            for tok in _tokenize(ent):
+                expanded = set(_tokenize(ent))
+                if tok:
+                    _SYN_INDEX.setdefault(tok, set()).update(expanded)
 
-        # tokens de meta (título/tags/sinônimos) para boost
+        # tokens de meta (para boosts)
         title_tokens = _tokenize(title)
-        tags_tokens: List[str] = []
+        tag_tokens: List[str] = []
         for t in tags:
-            tags_tokens.extend(_tokenize(t))
+            tag_tokens.extend(_tokenize(t))
         syn_tokens: List[str] = []
         for s in syns:
             syn_tokens.extend(_tokenize(s))
 
-        # gera chunks e aplica boost de meta como “repetição” no TF
+        # chunking
         for ch_text in _split_chunks(body):
             tokens = _tokenize(ch_text)
             tf: Dict[str, int] = {}
             for t in tokens:
                 tf[t] = tf.get(t, 0) + 1
 
-            # boosts: título/tags/sinônimos contam mais
+            # boosts de meta
             for t in title_tokens:
                 tf[t] = tf.get(t, 0) + TITLE_BOOST
-            for t in tags_tokens:
+            for t in tag_tokens:
                 tf[t] = tf.get(t, 0) + TAGS_BOOST
             for t in syn_tokens:
                 tf[t] = tf.get(t, 0) + SYN_BOOST
@@ -150,13 +162,12 @@ def _build_index() -> None:
                 "id": next_chunk_id,
                 "doc_id": doc_id,
                 "text": ch_text,
-                "tokens": list(tf.keys()),
                 "tf": tf,
                 "len": max(1, sum(tf.values())),
             })
             next_chunk_id += 1
 
-    # IDF
+    # IDF/AVGDL
     N = len(_CHUNKS) or 1
     df: Dict[str, int] = {}
     for ch in _CHUNKS:
@@ -165,7 +176,6 @@ def _build_index() -> None:
     _IDF = {t: math.log((N - df_t + 0.5) / (df_t + 0.5) + 1.0) for t, df_t in df.items()}
     _AVGDL = sum(ch["len"] for ch in _CHUNKS) / (len(_CHUNKS) or 1)
 
-    # salva um resumo do índice (opcional)
     try:
         KB_INDEX.write_text(json.dumps({
             "docs": len(_DOCS), "chunks": len(_CHUNKS), "avgdl": _AVGDL
@@ -177,19 +187,19 @@ def reindex() -> Dict[str, Any]:
     _build_index()
     return {"docs": len(_DOCS), "chunks": len(_CHUNKS), "avgdl": _AVGDL}
 
-# ----------------- busca -----------------
+# --------------------------------------------------------------------------------------
+# Busca (BM25 + priors opcionais)
+# --------------------------------------------------------------------------------------
 
 def _expand_query_tokens(q_tokens: List[str]) -> List[str]:
-    """Expansão leve de sinônimos/aliases a partir do índice global (_SYN_INDEX)."""
     out: List[str] = []
     for t in q_tokens:
         out.append(t)
         syns = _SYN_INDEX.get(t)
         if syns:
             out.extend(list(syns))
-    # remove duplicatas mantendo ordem
-    seen = set()
-    dedup = []
+    # dedup mantendo ordem
+    seen, dedup = set(), []
     for x in out:
         if x not in seen:
             dedup.append(x); seen.add(x)
@@ -208,75 +218,86 @@ def _bm25_score_from_tokens(q_tokens: Iterable[str], ch: Dict[str, Any]) -> floa
     return score
 
 def _bm25_score(query: str, ch: Dict[str, Any]) -> float:
-    q_tokens = _tokenize(query)
-    q_tokens = _expand_query_tokens(q_tokens) if q_tokens else []
+    q_tokens = _expand_query_tokens(_tokenize(query))
     return _bm25_score_from_tokens(q_tokens, ch)
 
-def search(query: str, k: int = 5) -> List[Dict[str, Any]]:
+def search(
+    query: str,
+    k: int = 5,
+    threshold: float = 1.5,
+    priors: Dict[str, float] | None = None,
+    alpha: float = 0.3,
+) -> List[Dict[str, Any]]:
+    """
+    Retorna os melhores trechos da KB para a 'query'.
+    - Usa BM25 (com boosts de meta) e aplica 'priors' preditivos por documento:
+      score_final = bm25 * (1 + alpha * prior_doc)   | prior ~ [-1 .. +1]
+    - Filtra por 'threshold' no score_final.
+    - Saída: lista ordenada por 'score' decrescente com metadados.
+    """
     if not _CHUNKS:
         return []
-    scored = [(_bm25_score(query, ch), ch) for ch in _CHUNKS]
+    priors = priors or {}
+
+    scored: List[Tuple[float, Dict[str, Any], float, float]] = []
+    for ch in _CHUNKS:
+        bm25 = _bm25_score(query, ch)
+        doc = _DOC_BY_ID[ch["doc_id"]]
+        prior = float(priors.get(doc["path"], 0.0))
+        score_final = bm25 * (1.0 + alpha * prior)
+        if score_final >= threshold:
+            scored.append((score_final, ch, bm25, prior))
+
     scored.sort(key=lambda x: x[0], reverse=True)
-    out = []
-    for s, ch in scored[:k]:
+    out: List[Dict[str, Any]] = []
+    for score_final, ch, bm25, prior in scored[:k]:
         doc = _DOC_BY_ID[ch["doc_id"]]
         out.append({
-            "score": round(s, 4),
+            "score": round(float(score_final), 4),
+            "bm25": round(float(bm25), 4),
+            "prior": round(float(prior), 4),
+            "doc_id": doc["id"],
             "doc_title": doc["title"],
             "doc_path": doc["path"],
-            "chunk_text": ch["text"]
+            "chunk_text": ch["text"],
         })
     return out
 
-# ----------------- resposta -----------------
+# --------------------------------------------------------------------------------------
+# Fallback simples para resposta direta (mantido para compatibilidade)
+# --------------------------------------------------------------------------------------
 
 def _merge_top_by_doc(hits: List[Dict[str, Any]], max_docs: int = 3) -> List[Dict[str, Any]]:
-    """Agrupa por documento, mantendo o melhor trecho de cada doc."""
     grouped: Dict[str, Dict[str, Any]] = {}
     for h in hits:
         key = h["doc_path"]
         if key not in grouped:
             grouped[key] = h
-    # mantém até max_docs
-    best = list(grouped.values())[:max_docs]
-    return best
+    return list(grouped.values())[:max_docs]
 
-def kb_try_answer(user_text: str, threshold: float = 2.5) -> Dict[str, Any] | None:
+def kb_try_answer(query: str, threshold: float = 2.5, priors: Dict[str, float] | None = None) -> Dict[str, Any] | None:
     """
-    Tenta responder com base no KB. Se a melhor evidência ficar abaixo do threshold,
-    retorna None para o bot seguir o fluxo normal/IA de triagem.
-
-    Dica: passar "assunto\\nmensagem" como user_text ajuda muito (assunto é usado como termos extras).
+    Usa a própria KB para montar uma resposta curta quando não há LLM.
     """
-    hits = search(user_text, k=8)
-    if not hits or hits[0]["score"] < threshold:
+    hits = search(query, k=8, threshold=threshold, priors=priors)
+    if not hits:
         return None
-
-    # Escolhe no máx. 3 docs (um trecho por doc) para evitar resposta longa demais
     top = _merge_top_by_doc(hits, max_docs=3)
-
-    # resposta direta (sem IA): compõe um texto amigável com trechos relevantes
     parts = []
     for h in top:
         snippet = h["chunk_text"].strip()
-        # heurística: se o snippet for uma lista de passos, deixe em bloco
-        if "\n1" in snippet or snippet.startswith(("-", "*")):
-            body = snippet
-        else:
-            body = snippet
-        parts.append(f"**{h['doc_title']}**\n{body}")
-
+        parts.append(f"**{h['doc_title']}**\n{snippet}")
     reply = (
         "Encontrei isto na nossa base de conhecimento:\n\n" +
         "\n\n---\n\n".join(parts) +
         "\n\nSe precisar, posso detalhar mais ou seguir com os próximos passos."
     )
-    return {
-        "reply": reply,
-        "sources": [{"title": h["doc_title"], "path": h["doc_path"], "score": h["score"]} for h in top]
-    }
+    return {"reply": reply, "sources": [{"title": h["doc_title"], "path": h["doc_path"], "score": h["score"]} for h in top]}
 
-# Carrega índice na importação
+# --------------------------------------------------------------------------------------
+# Inicialização
+# --------------------------------------------------------------------------------------
+
 try:
     stats = reindex()
     logger.info(f"[KB] indexado: {stats}")

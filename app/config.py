@@ -11,5 +11,7 @@ class Settings:
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "700"))
     DB_PATH: str = os.getenv("DB_PATH", "n1agent.db")
+    KB_TOP_K = 2
+    KB_MIN_SCORE = 0.62
 
 settings = Settings()

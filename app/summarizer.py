@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from typing import List, Optional
 
 # OpenAI é opcional: só usamos se OPENAI_API_KEY estiver definido
 _OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -16,6 +16,8 @@ if _OPENAI_KEY:
         _CLIENT = None
 
 
+# ---------------- Utils internos ----------------
+
 def _clean_text(t: str) -> str:
     if not t:
         return ""
@@ -27,6 +29,8 @@ def _clean_text(t: str) -> str:
     t = re.sub(r"\s*\n\s*", "\n", t)
     return t.strip()
 
+
+# ---------------- Heurística local ----------------
 
 def _heuristic_summary(text: str, max_chars: int = 900) -> str:
     """
@@ -60,11 +64,13 @@ def _heuristic_summary(text: str, max_chars: int = 900) -> str:
     return out or "Resumo: (conteúdo insuficiente)."
 
 
+# ---------------- API pública ----------------
+
 def summarize_conversation(transcript: str, max_words: int = 180) -> str:
     """
     Gera um resumo curto e objetivo da conversa para registrar no ticket.
-    - Se OPENAI_API_KEY existir, usa LLM (chat.completions) com portugues.
-    - Senão, aplica um resumo heurístico local.
+    - Se OPENAI_API_KEY existir, usa LLM (chat.completions).
+    - Senão, aplica resumo heurístico local.
     """
     transcript = (transcript or "").strip()
     if not transcript:
@@ -75,7 +81,7 @@ def summarize_conversation(transcript: str, max_words: int = 180) -> str:
         try:
             prompt_system = (
                 "Você é um assistente de suporte N1. Gere um resumo curto, objetivo e em português do Brasil "
-                "para ser registrado no histórico do chamado. "
+                "para registrar no histórico do chamado. "
                 "Formato sugerido:\n"
                 "Assunto (em 1 linha)\n"
                 "O que foi verificado / tentado (bullets)\n"
@@ -104,11 +110,30 @@ def summarize_conversation(transcript: str, max_words: int = 180) -> str:
             text = (resp.choices[0].message.content or "").strip()
             return text or _heuristic_summary(transcript)
         except Exception:
-            # Qualquer falha no provider → heurístico
             return _heuristic_summary(transcript)
 
     # Sem chave → heurístico
     return _heuristic_summary(transcript)
 
 
-__all__ = ["summarize_conversation"]
+def extract_steps(text: str, max_steps: int = 7) -> List[str]:
+    """
+    Extrai lista curta de passos a partir de um texto (bullets ou linhas numeradas).
+    Limita a no máx. max_steps e remove prefixos (1., -, •).
+    """
+    if not text:
+        return []
+    lines = [l.strip(" •-\t") for l in text.splitlines() if l and l.strip()]
+    bullets = [l for l in lines if re.match(r"^(\d+[\).\s]|[-*•])", l)]
+    arr = bullets if bullets else lines
+    out = []
+    for l in arr:
+        l = re.sub(r"^\d+[\).\s]+", "", l)
+        l = re.sub(r"^[-*•]\s*", "", l)
+        out.append(l[:220])
+        if len(out) >= max_steps:
+            break
+    return out
+
+
+__all__ = ["summarize_conversation", "extract_steps"]

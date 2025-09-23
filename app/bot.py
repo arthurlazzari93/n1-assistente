@@ -1,3 +1,4 @@
+# app/bot.py
 from __future__ import annotations
 
 import re
@@ -15,7 +16,8 @@ from loguru import logger
 
 from .movidesk_client import get_ticket_text_bundle
 from .kb import kb_try_answer
-from .ai.triage_agent import triage_next  # <- caminho corrigido
+from .ai.triage_agent import triage_next  # agente com intenção + priors + reranker
+from .learning import record_feedback, get_priors  # feedback preditivo
 
 
 class N1Bot(ActivityHandler):
@@ -26,10 +28,20 @@ class N1Bot(ActivityHandler):
       - confirma sempre com "Funcionou? Sim/Não", e encerra/escala conforme resposta
       - limite de 25 mensagens do agente por conversa
       - usa IA (triage_next) + KB como apoio quando fizer sentido
+      - registra feedback de sucesso/fracasso para aprendizado contínuo
     """
 
     YES_TOKENS = {"sim", "deu certo", "funcionou", "resolvido", "pode encerrar"}
-    NO_TOKENS = {"nao", "não", "ainda não", "nao deu", "não deu", "deu erro", "não funcionou", "nao funcionou"}
+    NO_TOKENS = {
+        "nao",
+        "não",
+        "ainda não",
+        "nao deu",
+        "não deu",
+        "deu erro",
+        "não funcionou",
+        "nao funcionou",
+    }
 
     def __init__(self, conversation_state: Optional[ConversationState] = None) -> None:
         if conversation_state is None:
@@ -45,9 +57,18 @@ class N1Bot(ActivityHandler):
     def _is_stuck(self, text: str) -> bool:
         t = (text or "").lower()
         gatilhos = [
-            "nao achei", "não achei", "nao encontro", "não encontro",
-            "nao aparece", "não aparece", "nao funciona", "não funciona",
-            "nao deu certo", "não deu certo", "nao estou achando", "não estou achando",
+            "nao achei",
+            "não achei",
+            "nao encontro",
+            "não encontro",
+            "nao aparece",
+            "não aparece",
+            "nao funciona",
+            "não funciona",
+            "nao deu certo",
+            "não deu certo",
+            "nao estou achando",
+            "não estou achando",
         ]
         return any(g in t for g in gatilhos)
 
@@ -80,6 +101,11 @@ class N1Bot(ActivityHandler):
         checklist = out.get("checklist") or []
         if checklist:
             reply += "\n\n" + "\n".join(f"- {p}" for p in checklist)
+
+        # 🔎 guarda doc e intenção selecionados pelo agente para feedback posterior
+        conv["best_doc_path"] = out.get("best_doc_path")
+        conv["best_intent"] = out.get("intent")
+
         return reply, out
 
     def _normalize_hist(self, conv: Dict[str, Any]) -> None:
@@ -125,25 +151,25 @@ class N1Bot(ActivityHandler):
 
     def _reset_conversation(self, conv: dict) -> None:
         """Encerra o atendimento atual e limpa estado para não vazar para o próximo ticket."""
-        conv.update({
-            "flow": None,
-            "ticket": None,
-            "subject": "",
-            "ctx": "",
-            "awaiting_ok": False,
-        })
+        conv.update(
+            {
+                "flow": None,
+                "ticket": None,
+                "subject": "",
+                "ctx": "",
+                "awaiting_ok": False,
+                "best_doc_path": None,  # limpar doc selecionado
+                "best_intent": None,    # limpar intenção selecionada
+            }
+        )
         conv["hist"] = []
         conv["agent_msgs"] = 0
 
     # ---------------- eventos ----------------
-    async def on_members_added_activity(
-        self, members_added: List[ChannelAccount], turn_context: TurnContext
-    ):
+    async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
-                await turn_context.send_activity(
-                    "✅ Online! Use `iniciar <ticket>` para começar."
-                )
+                await turn_context.send_activity("✅ Online! Use `iniciar <ticket>` para começar.")
 
     # ---------------- mensagens ----------------
     async def on_message_activity(self, turn_context: TurnContext):
@@ -156,8 +182,10 @@ class N1Bot(ActivityHandler):
         conv.setdefault("ticket", None)
         conv.setdefault("subject", "")
         conv.setdefault("ctx", "")
-        conv.setdefault("agent_msgs", 0)       # contador de mensagens do agente
+        conv.setdefault("agent_msgs", 0)  # contador de mensagens do agente
         conv.setdefault("awaiting_ok", False)  # aguardando "Sim/Não" do usuário?
+        conv.setdefault("best_doc_path", None)
+        conv.setdefault("best_intent", None)
         self._normalize_hist(conv)
 
         # -------- comandos ----------
@@ -179,15 +207,19 @@ class N1Bot(ActivityHandler):
             except Exception:
                 bundle = {"subject": "", "first_action_text": "", "first_action_html": ""}
 
-            conv.update({
-                "flow": "triage",
-                "ticket": ticket_id,
-                "subject": bundle.get("subject") or "",
-                "ctx": (bundle.get("first_action_text") or bundle.get("first_action_html") or "").strip(),
-                "hist": [],  # zera histórico ao iniciar
-                "agent_msgs": 0,
-                "awaiting_ok": False,
-            })
+            conv.update(
+                {
+                    "flow": "triage",
+                    "ticket": ticket_id,
+                    "subject": bundle.get("subject") or "",
+                    "ctx": (bundle.get("first_action_text") or bundle.get("first_action_html") or "").strip(),
+                    "hist": [],  # zera histórico ao iniciar
+                    "agent_msgs": 0,
+                    "awaiting_ok": False,
+                    "best_doc_path": None,
+                    "best_intent": None,
+                }
+            )
 
             opening = (
                 f"🚀 Vamos começar pelo #{ticket_id}: **{conv.get('subject','(sem assunto)')}**.\n"
@@ -224,13 +256,15 @@ class N1Bot(ActivityHandler):
                 await self._save(turn_context, conv)
                 return
 
-            # KB (só se fizer sentido)
+            # KB (só se fizer sentido) — mantém fallback atual
             kb_reply = None
             if action in ("answer", "resolve") and confidence >= 0.45:
                 ctx_text = (f"{ticket_ctx['subject']}\n{ticket_ctx['first_action_text']}".strip())
                 try:
                     if ctx_text:
-                        kb_hit = kb_try_answer(ctx_text)
+                        # usa priors (se já temos intent) para melhorar o fallback
+                        priors = get_priors(intent=out.get("intent")) if out.get("intent") else None
+                        kb_hit = kb_try_answer(ctx_text, priors=priors)
                         if kb_hit and kb_hit.get("sources"):
                             kb_reply = kb_hit["reply"]
                 except Exception:
@@ -263,13 +297,38 @@ class N1Bot(ActivityHandler):
             # confirmação primeiro
             if conv.get("awaiting_ok"):
                 if self._user_says_yes(text_raw):
+                    # ✅ feedback positivo antes de encerrar
+                    try:
+                        if conv.get("best_doc_path"):
+                            record_feedback(
+                                doc_path=conv.get("best_doc_path") or "",
+                                success=True,
+                                intent=conv.get("best_intent"),
+                                ticket_id=str(conv.get("ticket")),
+                            )
+                    except Exception as e:
+                        logger.warning(f"[BOT] falha ao registrar feedback positivo: {e}")
+
                     conv["awaiting_ok"] = False
                     conv["hist"].append({"role": "user", "text": text_raw})
                     await self._publish_summary_and_optionally_close(turn_context, conv, close=True)
                     self._reset_conversation(conv)
                     await self._save(turn_context, conv)
                     return
+
                 if self._user_says_no(text_raw):
+                    # ❌ feedback negativo (não resolveu)
+                    try:
+                        if conv.get("best_doc_path"):
+                            record_feedback(
+                                doc_path=conv.get("best_doc_path") or "",
+                                success=False,
+                                intent=conv.get("best_intent"),
+                                ticket_id=str(conv.get("ticket")),
+                            )
+                    except Exception as e:
+                        logger.warning(f"[BOT] falha ao registrar feedback negativo: {e}")
+
                     conv["awaiting_ok"] = False
                     conv["hist"].append({"role": "user", "text": text_raw})
                     await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
@@ -344,7 +403,5 @@ class N1Bot(ActivityHandler):
             return
 
         # sem ticket ainda
-        await turn_context.send_activity(
-            "Para começar, me diga o número do chamado (ex.: `iniciar 12345` ou só o número)."
-        )
+        await turn_context.send_activity("Para começar, me diga o número do chamado (ex.: `iniciar 12345` ou só o número).")
         await self._save(turn_context, conv)
