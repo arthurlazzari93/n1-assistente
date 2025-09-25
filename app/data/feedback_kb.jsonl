@@ -2,3 +2,5 @@
 {"ts": "2025-09-23T13:45:36.015373+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": false, "intent": "signature.generate", "ticket_id": "58044", "user_hash": null}
 {"ts": "2025-09-23T13:52:36.594841+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\configurar_assinatura_outlook.md", "success": true, "intent": "signature.configure", "ticket_id": "58048", "user_hash": null}
 {"ts": "2025-09-23T13:53:27.000472+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\configurar_assinatura_outlook.md", "success": true, "intent": "signature.generate", "ticket_id": "58048", "user_hash": null}
+{"ts": "2025-09-23T14:56:20.341272+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": false, "intent": "outlook.issue", "ticket_id": "58079", "user_hash": null}
+{"ts": "2025-09-23T14:58:29.621944+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": true, "intent": "outlook.issue", "ticket_id": "58079", "user_hash": null}

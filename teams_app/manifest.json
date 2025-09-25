@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
   "manifestVersion": "1.16",
-  "version": "1.0.5",
+  "version": "1.0.9",
   "id": "11f95e11-5e0b-40c2-9cdf-a16761df238f",
   "packageName": "com.tecnogera.n1",
   "developer": {
@@ -10,17 +10,17 @@
     "privacyUrl": "https://www.tecnogera.com.br/privacidade",
     "termsOfUseUrl": "https://www.tecnogera.com.br/termos"
   },
-  "name": { "short": "Tecnogera N1 Notifier" },
+  "name": { "short": "Assistente TINA" },
   "description": {
-    "short": "Notificações de tickets N1 no Teams",
-    "full": "App para notificar proativamente o usuário no Teams quando um ticket de TI é aberto no Movidesk."
+    "short": "Assistente de TI inteligente",
+    "full": "App para atendimentos de tickets de TI quando é aberto no Movidesk."
   },
   "icons": { "outline": "outline.png", "color": "color.png" },
   "accentColor": "#6264A7",
   "staticTabs": [
     {
       "entityId": "home",
-      "name": "Tecnogera N1",
+      "name": "Site Tecnogera",
       "scopes": ["personal"],
       "contentUrl": "https://www.tecnogera.com.br/",
       "websiteUrl": "https://www.tecnogera.com.br/"
@@ -60,6 +60,6 @@
     "smba.trafficmanager.net",
     "api.botframework.com",
     "webchat.botframework.com",
-    "d48ac11f745b.ngrok-free.app"
+    "adad4958f80f.ngrok-free.app"
   ]
 }

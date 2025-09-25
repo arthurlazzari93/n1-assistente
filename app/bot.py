@@ -287,7 +287,7 @@ class N1Bot(ActivityHandler):
         # “Sim”/“Não” sem ticket ativo → pedir número do chamado
         if conv.get("ticket") is None and (self._user_says_yes(text_raw) or self._user_says_no(text_raw)):
             await turn_context.send_activity(
-                "Ótimo! Me diga o número do chamado para começarmos (ex.: `iniciar 12345` ou apenas `12345`)."
+                "Ótimo! Me confirma o número do chamado para começarmos (ex.: `iniciar 12345` ou apenas `12345`)."
             )
             await self._save(turn_context, conv)
             return
