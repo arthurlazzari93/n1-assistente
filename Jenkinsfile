@@ -35,38 +35,41 @@ pipeline {
     }
 
     stage('Deploy (compose up)') {
-      steps {
+    steps {
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
-          sh """
+        sh """
             set -euxo pipefail
-            ssh -o StrictHostKeyChecking=no tecnogera@10.246.200.14 '
-              set -euxo pipefail
-              mkdir -p /opt/apps/n1agent
-              cd /opt/apps/n1agent
+            ssh -o StrictHostKeyChecking=no tecnogera@10.246.200.14 bash -s <<'REMOTE'
+            set -euxo pipefail
 
-              cat > docker-compose.yml <<EOF
-              services:
-                n1agent:
-                  image: ${DOCKER_IMAGE}:${TAG}
-                  env_file: .env
-                  restart: unless-stopped
-                  healthcheck:
-                    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/healthz"]
-                    interval: 20s
-                    timeout: 5s
-                    retries: 5
-                  ports:
-                    - "127.0.0.1:8001:8001"
-              EOF
+            mkdir -p /opt/apps/n1agent
 
-              docker compose pull
-              docker compose up -d
-              docker image prune -f || true
-            '
-          """
+            # escreve docker-compose.yml no host
+            cat > /opt/apps/n1agent/docker-compose.yml <<YML
+            services:
+            n1agent:
+                image: ${DOCKER_IMAGE}:${TAG}
+                env_file: .env
+                restart: unless-stopped
+                healthcheck:
+                test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/healthz || exit 1"]
+                interval: 20s
+                timeout: 5s
+                retries: 5
+                ports:
+                - "127.0.0.1:8001:8001"
+            YML
+
+            cd /opt/apps/n1agent
+            docker compose pull
+            docker compose up -d
+            docker image prune -f || true
+            REMOTE
+        """
         }
-      }
     }
+    }
+
 
     stage('Smoke') {
       steps {
