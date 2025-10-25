@@ -1,18 +1,16 @@
-version: "3.9"
 services:
-  n1-assistente:
-    build: .
-    image: ghcr.io/SEU_GITHUB/n1-assistente:${IMAGE_TAG:-dev}
+  n1agent:
+    image: tecnogera/n1agent:dev   # durante dev local; no CI trocaremos por tags
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env                 # em produção NÃO commitar .env real; usaremos .env no servidor
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      DB_PATH: /data/n1agent.db
-    volumes:
-      - n1_data:/data
-      # se a KB for arquivos .md em app/knowledge, pode bindar somente em dev:
-      # - ./app/knowledge:/app/app/knowledge:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    # bind só em loopback para o Cloudflare Tunnel enxergar sem expor externamente
     ports:
-      - "8087:8000"  # DEV LOCAL apenas; no servidor evitar conflito com outras ferramentas
-volumes:
-  n1_data:
+      - "127.0.0.1:8001:8001"
