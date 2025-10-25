@@ -36,42 +36,35 @@ pipeline {
 
     stage('Deploy (compose up)') {
       steps {
-        // 1) Gerar o arquivo docker-compose.yml no workspace (com a tag da imagem)
-        writeFile file: 'docker-compose.deploy.yml', text: """
-    services:
-    n1agent:
-        image: ${DOCKER_IMAGE}:${TAG}
-        env_file: .env
-        restart: unless-stopped
-        healthcheck:
-        test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/healthz || exit 1"]
-        interval: 20s
-        timeout: 5s
-        retries: 5
-        ports:
-        - "127.0.0.1:8001:8001"
-    """
-
-        // 2) Enviar o compose e aplicar no host
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
-        sh '''
-            set -euxo pipefail
+            sh """
+                set -euxo pipefail
+                ssh -o StrictHostKeyChecking=no tecnogera@10.246.200.14 /bin/bash -se <<'REMOTE'
+                set -euxo pipefail
 
-            # Garante a pasta no host
-            ssh -o StrictHostKeyChecking=no tecnogera@10.246.200.14 "mkdir -p /opt/apps/n1agent"
+                mkdir -p /opt/apps/n1agent
 
-            # Copia o compose gerado
-            scp -o StrictHostKeyChecking=no docker-compose.deploy.yml tecnogera@10.246.200.14:/opt/apps/n1agent/docker-compose.yml
+                cat > /opt/apps/n1agent/docker-compose.yml <<YML
+                services:
+                n1agent:
+                    image: ${DOCKER_IMAGE}:${TAG}
+                    env_file: .env
+                    restart: unless-stopped
+                    healthcheck:
+                    test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/healthz || exit 1"]
+                    interval: 20s
+                    timeout: 5s
+                    retries: 5
+                    ports:
+                    - "127.0.0.1:8001:8001"
+                YML
 
-            # Pull + Up
-            ssh -o StrictHostKeyChecking=no tecnogera@10.246.200.14 "
-            set -euxo pipefail
-            cd /opt/apps/n1agent
-            docker compose pull
-            docker compose up -d
-            docker image prune -f || true
-            "
-        '''
+                cd /opt/apps/n1agent
+                docker compose pull
+                docker compose up -d
+                docker image prune -f || true
+                REMOTE
+            """
         }
       }
     }
