@@ -2,22 +2,13 @@ pipeline {
   agent any
   environment {
     DOCKER_IMAGE = "tecnogera/n1agent"
-    TAG = "${env.BUILD_NUMBER}"          // você pode trocar para o curto do git: ${env.GIT_COMMIT[0..6]}
+    TAG = "${env.BUILD_NUMBER}"
   }
   stages {
     stage('Checkout') {
       steps {
-        withCredentials([string(credentialsId: 'github-pat', variable: 'GITHUB_PAT')]) {
-          // Clona via HTTPS usando PAT (sem dor com chaves)
-          sh '''
-            set -e
-            REPO_URL="$(git config --get remote.origin.url || true)"
-            if [ -z "$REPO_URL" ]; then
-              echo "[INFO] Defina o URL do repositório nas configurações do job ou use o Multibranch Pipeline."
-            fi
-          '''
-          checkout scm
-        }
+        // O SCM (config. do job) já usa a credencial Username/Password (github-https ou github-pat)
+        checkout scm
       }
     }
 
@@ -53,7 +44,6 @@ pipeline {
               mkdir -p /opt/apps/n1agent
               cd /opt/apps/n1agent
 
-              # grava/atualiza compose (produção simples)
               cat > docker-compose.yml <<EOF
               services:
                 n1agent:
@@ -69,7 +59,6 @@ pipeline {
                     - "127.0.0.1:8001:8001"
               EOF
 
-              # pull + up
               docker compose pull
               docker compose up -d
               docker image prune -f || true
