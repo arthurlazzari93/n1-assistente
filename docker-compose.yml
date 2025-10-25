@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  n1-assistente:
+    build: .
+    image: ghcr.io/SEU_GITHUB/n1-assistente:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/n1agent.db
+    volumes:
+      - n1_data:/data
+      # se a KB for arquivos .md em app/knowledge, pode bindar somente em dev:
+      # - ./app/knowledge:/app/app/knowledge:ro
+    ports:
+      - "8087:8000"  # DEV LOCAL apenas; no servidor evitar conflito com outras ferramentas
+volumes:
+  n1_data:

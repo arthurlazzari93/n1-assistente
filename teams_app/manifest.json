@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
   "manifestVersion": "1.16",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "id": "11f95e11-5e0b-40c2-9cdf-a16761df238f",
   "packageName": "com.tecnogera.n1",
   "developer": {

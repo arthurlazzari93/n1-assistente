@@ -4,3 +4,12 @@
 {"ts": "2025-09-23T13:53:27.000472+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\configurar_assinatura_outlook.md", "success": true, "intent": "signature.generate", "ticket_id": "58048", "user_hash": null}
 {"ts": "2025-09-23T14:56:20.341272+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": false, "intent": "outlook.issue", "ticket_id": "58079", "user_hash": null}
 {"ts": "2025-09-23T14:58:29.621944+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": true, "intent": "outlook.issue", "ticket_id": "58079", "user_hash": null}
+{"ts": "2025-09-26T14:37:42.703393+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\reset_senha.md", "success": false, "intent": "vpn.access", "ticket_id": "58593", "user_hash": null}
+{"ts": "2025-09-26T16:18:55.720376+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": true, "intent": "signature.generate", "ticket_id": "58586", "user_hash": null}
+{"ts": "2025-09-26T19:09:58.628416+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": true, "intent": "other", "ticket_id": "58655", "user_hash": null}
+{"ts": "2025-10-15T15:05:45.525564+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\configurar_assinatura_outlook.md", "success": true, "intent": "signature.generate", "ticket_id": "61200", "user_hash": null}
+{"ts": "2025-10-15T18:52:26.843193+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\instalacao_sisloc.md", "success": false, "intent": "other", "ticket_id": "61272", "user_hash": null}
+{"ts": "2025-10-16T12:01:33.020111+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": false, "intent": "other", "ticket_id": "61333", "user_hash": null}
+{"ts": "2025-10-16T12:32:03.393311+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\assinatura_email.md", "success": false, "intent": "other", "ticket_id": "61341", "user_hash": null}
+{"ts": "2025-10-16T13:45:12.625074+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\instalacao_sisloc.md", "success": false, "intent": "other", "ticket_id": "61361", "user_hash": null}
+{"ts": "2025-10-16T15:03:27.547045+00:00", "doc_path": "C:\\n1-assistente\\app\\knowledge\\instalacao_sisloc.md", "success": false, "intent": "vpn.access", "ticket_id": "61382", "user_hash": null}
