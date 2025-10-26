@@ -10,7 +10,7 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps { checkout scm } // usa a credencial do SCM configurada no Job (PAT como Username/Password)
+      steps { checkout scm }
     }
 
     stage('Build image') {
@@ -37,7 +37,7 @@ pipeline {
 
     stage('Deploy (compose up)') {
       steps {
-        // gera o compose no workspace (sem credenciais — usa env_file)
+        // 1) gera o compose no workspace (usa env_file no host)
         writeFile file: 'docker-compose.deploy.yml', text: """services:
   n1agent:
     image: ${DOCKER_IMAGE}:${TAG}
@@ -52,23 +52,24 @@ pipeline {
       - "${PORT_BIND}"
 """
 
+        // 2) copia + normaliza + valida + sobe
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
           sh '''
             set -euxo pipefail
 
-            # garante diretório remoto
+            # garante diretório
             ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "mkdir -p ${REMOTE_DIR}"
 
             # envia compose
             scp -o StrictHostKeyChecking=no docker-compose.deploy.yml \
                 tecnogera@${HOST}:${REMOTE_DIR}/docker-compose.yml
 
-            # normaliza (apenas CRLF), valida e sobe
-            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} /bin/bash -se <<'REMOTE'
+            # *** IMPORTANTE: injeta REMOTE_DIR no ambiente remoto ***
+            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "export REMOTE_DIR='${REMOTE_DIR}'; /bin/bash -se" <<'REMOTE'
             set -euxo pipefail
-            cd ${REMOTE_DIR}
+            cd "$REMOTE_DIR"
 
-            # remover CRLF se houver (dos2unix "manual")
+            # remover CRLF (dos2unix manual, se necessário)
             sed -i 's/\r$//' docker-compose.yml || true
 
             echo '--- docker-compose.yml ---'
@@ -90,9 +91,11 @@ pipeline {
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
           sh '''
             set -euxo pipefail
-            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} /bin/bash -se <<'REMOTE'
+
+            # *** IMPORTANTE: injeta REMOTE_DIR também aqui ***
+            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "export REMOTE_DIR='${REMOTE_DIR}'; /bin/bash -se" <<'REMOTE'
             set -euxo pipefail
-            cd ${REMOTE_DIR}
+            cd "$REMOTE_DIR"
 
             CID=$(docker compose ps -q n1agent || true)
             if [ -z "$CID" ]; then
