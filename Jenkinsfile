@@ -10,7 +10,7 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps { checkout scm } // usa credencial do SCM configurada no Job (PAT como Username/Password)
     }
 
     stage('Build image') {
@@ -37,7 +37,7 @@ pipeline {
 
     stage('Deploy (compose up)') {
       steps {
-        // 1) gera o compose no workspace (usa env_file no host)
+        // 1) gera docker-compose no workspace (sem segredos; usa env_file no host)
         writeFile file: 'docker-compose.deploy.yml', text: """services:
   n1agent:
     image: ${DOCKER_IMAGE}:${TAG}
@@ -52,35 +52,47 @@ pipeline {
       - "${PORT_BIND}"
 """
 
-        // 2) copia + normaliza + valida + sobe
+        // 2) gera script remoto de deploy
+        writeFile file: 'remote_deploy.sh', text: '''#!/usr/bin/env bash
+set -euxo pipefail
+
+: "${REMOTE_DIR:?REMOTE_DIR não definido}"
+
+cd "$REMOTE_DIR"
+
+# normalizar fim de linha (CRLF -> LF), se houver
+sed -i 's/\r$//' docker-compose.yml || true
+
+echo '--- docker-compose.yml ---'
+sed -n '1,80p' docker-compose.yml
+echo '--------------------------'
+
+docker compose config -q
+docker compose pull
+docker compose up -d
+docker image prune -f || true
+'''
+
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
           sh '''
             set -euxo pipefail
 
-            # garante diretório
+            # garante diretório remoto
             ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "mkdir -p ${REMOTE_DIR}"
 
-            # envia compose
+            # envia compose e script
             scp -o StrictHostKeyChecking=no docker-compose.deploy.yml \
                 tecnogera@${HOST}:${REMOTE_DIR}/docker-compose.yml
+            scp -o StrictHostKeyChecking=no remote_deploy.sh \
+                tecnogera@${HOST}:/tmp/remote_deploy.sh
 
-            # *** IMPORTANTE: injeta REMOTE_DIR no ambiente remoto ***
-            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "export REMOTE_DIR='${REMOTE_DIR}'; /bin/bash -se" <<'REMOTE'
-            set -euxo pipefail
-            cd "$REMOTE_DIR"
-
-            # remover CRLF (dos2unix manual, se necessário)
-            sed -i 's/\r$//' docker-compose.yml || true
-
-            echo '--- docker-compose.yml ---'
-            sed -n '1,80p' docker-compose.yml
-            echo '--------------------------'
-
-            docker compose config -q
-            docker compose pull
-            docker compose up -d
-            docker image prune -f || true
-            REMOTE
+            # executa script no host (injeta REMOTE_DIR) e remove
+            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "
+              set -euxo pipefail
+              chmod +x /tmp/remote_deploy.sh
+              REMOTE_DIR='${REMOTE_DIR}' /tmp/remote_deploy.sh
+              rm -f /tmp/remote_deploy.sh
+            "
           '''
         }
       }
@@ -88,43 +100,59 @@ pipeline {
 
     stage('Wait for health & Smoke') {
       steps {
+        // script remoto de espera/health
+        writeFile file: 'remote_wait.sh', text: '''#!/usr/bin/env bash
+set -euxo pipefail
+
+: "${REMOTE_DIR:?REMOTE_DIR não definido}"
+
+cd "$REMOTE_DIR"
+
+CID=$(docker compose ps -q n1agent || true)
+if [ -z "$CID" ]; then
+  echo "Container ID não encontrado"
+  docker compose ps
+  exit 1
+fi
+
+echo 'Aguardando health=healthy...'
+i=0
+until [ $i -ge 45 ]; do
+  st=$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo 'unknown')
+  echo "[$i] status=$st"
+  [ "$st" = "healthy" ] && break
+  i=$((i+1))
+  sleep 2
+done
+
+st=$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo 'unknown')
+if [ "$st" != "healthy" ]; then
+  echo 'Container não ficou healthy a tempo. Logs recentes:'
+  docker compose logs --no-color --tail=200 n1agent || true
+  exit 1
+fi
+
+# smoke HTTP local
+curl -fsS http://127.0.0.1:8001/healthz
+
+# inventário
+docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}" | sed -n '1,15p'
+'''
+
         sshagent(credentials: ['ssh-tecnogera-rsa']) {
           sh '''
             set -euxo pipefail
 
-            # *** IMPORTANTE: injeta REMOTE_DIR também aqui ***
-            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "export REMOTE_DIR='${REMOTE_DIR}'; /bin/bash -se" <<'REMOTE'
-            set -euxo pipefail
-            cd "$REMOTE_DIR"
+            # envia e executa o script de espera/health
+            scp -o StrictHostKeyChecking=no remote_wait.sh \
+                tecnogera@${HOST}:/tmp/remote_wait.sh
 
-            CID=$(docker compose ps -q n1agent || true)
-            if [ -z "$CID" ]; then
-              echo 'Container ID não encontrado'; docker compose ps; exit 1
-            fi
-
-            echo 'Aguardando health=healthy...'
-            i=0
-            until [ $i -ge 45 ]; do
-              st=$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo 'unknown')
-              echo "[$i] status=$st"
-              [ "$st" = "healthy" ] && break
-              i=$((i+1))
-              sleep 2
-            done
-
-            st=$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo 'unknown')
-            if [ "$st" != "healthy" ]; then
-              echo 'Container não ficou healthy a tempo. Logs recentes:'
-              docker compose logs --no-color --tail=200 n1agent || true
-              exit 1
-            fi
-
-            # smoke HTTP local
-            curl -fsS http://127.0.0.1:8001/healthz
-
-            # inventário para auditoria
-            docker ps --format "table {{.Names}}\t{{.Ports}}\t{{.Status}}" | sed -n '1,15p'
-            REMOTE
+            ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "
+              set -euxo pipefail
+              chmod +x /tmp/remote_wait.sh
+              REMOTE_DIR='${REMOTE_DIR}' /tmp/remote_wait.sh
+              rm -f /tmp/remote_wait.sh
+            "
           '''
         }
       }
