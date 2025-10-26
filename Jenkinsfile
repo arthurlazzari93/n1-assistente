@@ -10,7 +10,7 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps { checkout scm } // usa a credencial do SCM configurada no Job
+      steps { checkout scm } // usa a credencial do SCM configurada no Job (PAT como Username/Password)
     }
 
     stage('Build image') {
@@ -56,20 +56,19 @@ pipeline {
           sh '''
             set -euxo pipefail
 
-            # garante diretório
+            # garante diretório remoto
             ssh -o StrictHostKeyChecking=no tecnogera@${HOST} "mkdir -p ${REMOTE_DIR}"
 
             # envia compose
             scp -o StrictHostKeyChecking=no docker-compose.deploy.yml \
                 tecnogera@${HOST}:${REMOTE_DIR}/docker-compose.yml
 
-            # normaliza, valida e sobe
+            # normaliza (apenas CRLF), valida e sobe
             ssh -o StrictHostKeyChecking=no tecnogera@${HOST} /bin/bash -se <<'REMOTE'
             set -euxo pipefail
             cd ${REMOTE_DIR}
 
-            # normalizar: remover BOM e CRLF (se houver)
-            sed -i '1s/^\xEF\xBB\xBF//' docker-compose.yml || true
+            # remover CRLF se houver (dos2unix "manual")
             sed -i 's/\r$//' docker-compose.yml || true
 
             echo '--- docker-compose.yml ---'
