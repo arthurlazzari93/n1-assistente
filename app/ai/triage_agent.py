@@ -322,3 +322,30 @@ def triage_next(history: List[Dict[str, Any]], ticket: Dict[str, Any]) -> Dict[s
     data["best_doc_path"] = hits[0].get("doc_path")
     data["intent"] = intent
     return data
+
+
+def ia_generate_message(prompt: str, temperature: float = 0.4, max_tokens: int = 240) -> str:
+    """
+    Mensagem auxiliar para gerar a primeira fala do bot via LLM.
+    Retorna string vazia se não houver modelo configurado ou em caso de erro.
+    """
+    text = (prompt or "").strip()
+    if not text or not _CLIENT:
+        return ""
+    try:
+        resp = _CLIENT.chat.completions.create(
+            model=_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Você cria mensagens iniciais curtas, simpáticas e profissionais em PT-BR.",
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        msg = resp.choices[0].message.content or ""
+        return msg.strip()
+    except Exception:
+        return ""

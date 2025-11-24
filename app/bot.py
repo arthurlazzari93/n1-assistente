@@ -81,6 +81,32 @@ class N1Bot(ActivityHandler):
         t = (text or "").lower().strip()
         return any(tok == t or tok in t for tok in self.NO_TOKENS)
 
+    def _build_kb_query_text(self, ticket_ctx: Dict[str, Any], conv: Dict[str, Any]) -> str:
+        subject = (ticket_ctx.get("subject") or "").strip()
+        first_action = (ticket_ctx.get("first_action_text") or "").strip()
+        last_user = ""
+        for msg in reversed(conv.get("hist", [])):
+            if (msg.get("role") or "").lower() == "user":
+                txt = (msg.get("text") or "").strip()
+                if txt:
+                    last_user = txt
+                    break
+        parts = [subject, first_action, last_user]
+        return "\n".join(part for part in parts if part).strip()
+
+    def _maybe_use_kb(self, ticket_ctx: Dict[str, Any], conv: Dict[str, Any], intent: Optional[str]) -> Optional[str]:
+        query = self._build_kb_query_text(ticket_ctx, conv)
+        if not query:
+            return None
+        try:
+            priors = get_priors(intent=intent) if intent else None
+            kb_hit = kb_try_answer(query, priors=priors)
+            if kb_hit and kb_hit.get("sources"):
+                return kb_hit["reply"]
+        except Exception as e:
+            logger.warning(f"[BOT] fallback KB falhou: {e}")
+        return None
+
     async def _triage_with_hint(self, conv: dict, ticket_ctx: dict, extra_hint: Optional[str]):
         """Chama o agente IA com histórico (+ dica genérica quando necessário)."""
         hist = list(conv.get("hist", []))
@@ -232,9 +258,11 @@ class N1Bot(ActivityHandler):
             opening = f"🚀 Vamos começar pelo #{ticket_id}: **{subject}**.\nVou te guiar. Caso apareça algum erro/tela diferente, me diga o que aparece."  # fallback caso IA falhe
             try:
                 from app.ai.triage_agent import ia_generate_message  # adapte para seu client LLM real
-                opening = ia_generate_message(prompt)
+                generated = ia_generate_message(prompt)
+                if generated.strip():
+                    opening = generated.strip()
             except Exception:
-                pass
+                logger.warning("[BOT] não foi possível gerar saudação via IA (usa fallback).")
             conv["hist"].append({"role": "assistant", "text": opening})
             conv["agent_msgs"] += 1
             await turn_context.send_activity(opening)
@@ -262,23 +290,25 @@ class N1Bot(ActivityHandler):
                 conv["hist"].append({"role": "assistant", "text": reply})
                 conv["agent_msgs"] += 1
                 await turn_context.send_activity(reply)
+                try:
+                    if conv.get("best_doc_path"):
+                        record_feedback(
+                            doc_path=conv.get("best_doc_path") or "",
+                            success=False,
+                            intent=conv.get("best_intent"),
+                            ticket_id=str(conv.get("ticket")),
+                        )
+                except Exception as e:
+                    logger.warning(f"[BOT] falha ao registrar feedback (escalate): {e}")
                 await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
+                self._reset_conversation(conv)
                 await self._save(turn_context, conv)
                 return
 
             # KB (só se fizer sentido) — mantém fallback atual
             kb_reply = None
             if action in ("answer", "resolve") and confidence >= 0.45:
-                ctx_text = (f"{ticket_ctx['subject']}\n{ticket_ctx['first_action_text']}".strip())
-                try:
-                    if ctx_text:
-                        # usa priors (se já temos intent) para melhorar o fallback
-                        priors = get_priors(intent=out.get("intent")) if out.get("intent") else None
-                        kb_hit = kb_try_answer(ctx_text, priors=priors)
-                        if kb_hit and kb_hit.get("sources"):
-                            kb_reply = kb_hit["reply"]
-                except Exception:
-                    kb_reply = None
+                kb_reply = self._maybe_use_kb(ticket_ctx, conv, out.get("intent"))
 
             has_steps = bool(out.get("checklist")) or action in ("answer", "resolve")
             if kb_reply:
@@ -369,6 +399,7 @@ class N1Bot(ActivityHandler):
 
             # ESCALONAR?
             action = (out.get("action") or "").lower()
+            confidence = float(out.get("confidence") or 0) if isinstance(out.get("confidence"), (int, float, str)) else 0.0
             if action == "escalate":
                 reply = (
                     (out.get("message") or "Este atendimento precisa de um técnico por envolver permissões administrativas.").strip()
@@ -380,7 +411,18 @@ class N1Bot(ActivityHandler):
                 conv["hist"].append({"role": "assistant", "text": reply})
                 conv["agent_msgs"] += 1
                 await turn_context.send_activity(reply)
+                try:
+                    if conv.get("best_doc_path"):
+                        record_feedback(
+                            doc_path=conv.get("best_doc_path") or "",
+                            success=False,
+                            intent=conv.get("best_intent"),
+                            ticket_id=str(conv.get("ticket")),
+                        )
+                except Exception as e:
+                    logger.warning(f"[BOT] falha ao registrar feedback (escalate): {e}")
                 await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
+                self._reset_conversation(conv)
                 await self._save(turn_context, conv)
                 return
 
@@ -393,16 +435,29 @@ class N1Bot(ActivityHandler):
                     "OU faça uma pergunta de desambiguação específica e única. Curto e objetivo."
                 )
                 reply, out = await self._triage_with_hint(conv, ticket_ctx, alt_hint)
+                action = (out.get("action") or "").lower()
+                confidence = float(out.get("confidence") or 0) if isinstance(out.get("confidence"), (int, float, str)) else 0.0
 
             # limite de 25 mensagens do agente
             if conv["agent_msgs"] >= 25:
+                await turn_context.send_activity(
+                    "Chegamos ao limite de tentativas automáticas. Vou encaminhar para um técnico e registrar o resumo no chamado."
+                )
                 await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
+                self._reset_conversation(conv)
                 await self._save(turn_context, conv)
                 return
 
+            kb_reply = None
+            if action in ("answer", "resolve") and confidence >= 0.45:
+                kb_reply = self._maybe_use_kb(ticket_ctx, conv, out.get("intent"))
+
             # confirmação quando houver passo-a-passo
             has_steps = bool(out.get("checklist")) or action in ("answer", "resolve")
-            if has_steps:
+            if kb_reply:
+                reply = f"{reply}\n\n{kb_reply}\n\n**Funcionou?** Responda *Sim* ou *Não*."
+                conv["awaiting_ok"] = True
+            elif has_steps:
                 reply = reply.rstrip() + "\n\n**Funcionou?** Responda *Sim* ou *Não*."
                 conv["awaiting_ok"] = True
 
