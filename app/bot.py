@@ -18,6 +18,7 @@ from .movidesk_client import get_ticket_text_bundle
 from .kb import kb_try_answer
 from .ai.triage_agent import triage_next  # agente com intenção + priors + reranker
 from .learning import record_feedback, get_priors  # feedback preditivo
+from .ai.prompt_builder import build_initial_prompt
 
 
 class N1Bot(ActivityHandler):
@@ -221,10 +222,19 @@ class N1Bot(ActivityHandler):
                 }
             )
 
-            opening = (
-                f"🚀 Vamos começar pelo #{ticket_id}: **{conv.get('subject','(sem assunto)')}**.\n"
-                "Vou te guiar. Caso apareça algum erro/tela diferente, me diga o que aparece."
-            )
+            # Gera prompt dinâmico para abordagem inicial no Teams com IA
+            user_full_name = (turn_context.activity.from_property.name if hasattr(turn_context.activity.from_property, 'name') and turn_context.activity.from_property.name else "Usuário")
+            subject = conv.get('subject','(sem assunto)')
+            prompt = build_initial_prompt(user_full_name, ticket_id, subject)
+            # Aqui você deve substituir esta chamada por sua função de IA real
+            # Exemplo com função fictícia ia_generate_message(prompt):
+            # opening = ia_generate_message(prompt)
+            opening = f"🚀 Vamos começar pelo #{ticket_id}: **{subject}**.\nVou te guiar. Caso apareça algum erro/tela diferente, me diga o que aparece."  # fallback caso IA falhe
+            try:
+                from app.ai.triage_agent import ia_generate_message  # adapte para seu client LLM real
+                opening = ia_generate_message(prompt)
+            except Exception:
+                pass
             conv["hist"].append({"role": "assistant", "text": opening})
             conv["agent_msgs"] += 1
             await turn_context.send_activity(opening)
