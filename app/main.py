@@ -5,6 +5,7 @@ import os
 import sys
 import traceback
 import asyncio
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -34,6 +35,22 @@ from app.db import (
     cancel_followups,
     connect,
     mark_teams_notified,
+    log_ingest_event,
+    INGEST_SOURCE_MOVIDESK_WEBHOOK,
+    INGEST_ACTION_PAYLOAD_RECEIVED,
+    INGEST_ACTION_FETCH_TICKET,
+    INGEST_ACTION_CLASSIFY_TICKET_LLM,
+    INGEST_ACTION_CLASSIFY_TICKET_FALLBACK,
+    INGEST_ACTION_UPSERT_TICKET,
+    INGEST_ACTION_SCHEDULE_FOLLOWUP,
+    INGEST_ACTION_NOTIFY_TEAMS,
+    INGEST_ACTION_SKIP_FLOW,
+    get_ingest_metrics,
+    get_followup_metrics,
+    get_recent_tickets,
+    set_user_current_ticket,
+    INGEST_SOURCE_TEAMS_BOT,
+    INGEST_ACTION_PROACTIVE_FOLLOWUP,
 )
 
 from app.movidesk_client import (
@@ -56,13 +73,13 @@ from app.llm import classify_ticket_with_llm
 from app.teams_graph import (
     TeamsGraphError,
     notify_user_for_ticket,
-    send_proactive_message,
     diag_token_info,
     diag_resolve_app,
     diag_user,
     diag_user_installed_apps,
 )
 from app import kb
+from app.learning import get_feedback_metrics
 
 # lazy import: função opcional; evita quebrar a inicialização se o módulo estiver parcial
 try:
@@ -126,6 +143,50 @@ ORIGIN_MAP = {
 }
 
 _NOTIFIED_TICKETS = set()  # tickets já notificados (somente em memória)
+
+
+def _log_ingest(action: str, status: str, ticket_id: int | None = None, error_message: str | None = None, context: dict | None = None):
+    """
+    Telemetria leve para monitorar ingestões Movidesk.
+    Falhas ao gravar não podem derrubar o fluxo principal.
+    """
+    try:
+        log_ingest_event(
+            source=INGEST_SOURCE_MOVIDESK_WEBHOOK,
+            action=action,
+            status=status,
+            ticket_id=str(ticket_id) if ticket_id is not None else None,
+            error_message=error_message,
+            context=context,
+        )
+    except Exception as exc:  # pragma: no cover - telemetria não deve falhar testes
+        logger.warning(f"[telemetry] falha ao registrar {action}: {exc}")
+
+
+def _log_bot(action: str, status: str, ticket_id: int | None = None, error_message: str | None = None, context: dict | None = None):
+    try:
+        log_ingest_event(
+            source=INGEST_SOURCE_TEAMS_BOT,
+            action=action,
+            status=status,
+            ticket_id=str(ticket_id) if ticket_id is not None else None,
+            error_message=error_message,
+            context=context,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f"[bot-telemetry] falha ao registrar {action}: {exc}")
+
+
+def _format_followup_message(ticket_id: int, subject: str, step_message: str) -> str:
+    subject_line = subject or f"Ticket #{ticket_id}"
+    base = (
+        f"Ticket #{ticket_id} • {subject_line}\n"
+        f"{step_message}\n\n"
+        "Se já resolveu, responda **Sim**.\n"
+        "Se ainda precisa de ajuda, responda **Não** com o que aconteceu.\n"
+        "Para ver todos os seus chamados, envie `listar`."
+    )
+    return base
 
 def extract_core_fields(ticket_id: int) -> dict:
     """
@@ -268,6 +329,44 @@ def _debug_routes():
     return [getattr(r, "path", str(r)) for r in app.router.routes]
 
 
+@app.get("/debug/metrics")
+def debug_metrics():
+    """
+    Endpoint de observabilidade: consolida ingest_events, followups, tickets e feedback da KB.
+    Apoiado pela telemetria criada em ingest_events e pelos helpers de banco/learning.py.
+    """
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat()}
+    errors: list[str] = []
+
+    try:
+        payload["ingest"] = get_ingest_metrics()
+    except Exception as e:
+        logger.exception("[metrics] falha ao ler ingest_metrics: {}", e)
+        errors.append(f"ingest:{e}")
+
+    try:
+        payload["followups"] = get_followup_metrics()
+    except Exception as e:
+        logger.exception("[metrics] falha ao ler followups: {}", e)
+        errors.append(f"followups:{e}")
+
+    try:
+        payload["tickets"] = {"recent": get_recent_tickets()}
+    except Exception as e:
+        logger.exception("[metrics] falha ao listar tickets recentes: {}", e)
+        errors.append(f"tickets:{e}")
+
+    try:
+        payload["feedback"] = get_feedback_metrics()
+    except Exception as e:
+        logger.exception("[metrics] falha ao ler feedback da KB: {}", e)
+        errors.append(f"feedback:{e}")
+
+    if errors:
+        payload["errors"] = errors
+    return payload
+
+
 @app.post("/debug/chat/triage", response_model=ChatResponse)
 def debug_chat_triage(body: ChatRequest):
     """
@@ -324,14 +423,52 @@ def _followups_already_scheduled(ticket_id: int) -> bool:
         return False
 
 def _process_followups_once() -> int:
+    """
+    Worker responsável por consumir ticket_followups e enviar mensagens proativas no Teams.
+    Quando um lembrete é disparado, a função inclui informações do ticket e atualiza o contexto
+    multi-ticket do usuário (via set_user_current_ticket) para que respostas subsequentes "Sim/Não"
+    retomem automaticamente o mesmo chamado.
+    """
     due = fetch_due_followups(limit=50)
     sent = 0
     for fu in due:
         ok = False
         try:
-            ok = send_proactive_message(fu["requester_email"], fu["message"])
+            subject_line = fu.get("subject") or f"Ticket #{fu['ticket_id']}"
+            message = _format_followup_message(int(fu["ticket_id"]), subject_line, fu["message"])
+            graph_user_id = notify_user_for_ticket(
+                fu["requester_email"],
+                int(fu["ticket_id"]),
+                subject_line,
+                preview_text=message,
+            )
+            if graph_user_id:
+                set_user_current_ticket(fu["requester_email"], int(fu["ticket_id"]), teams_user_id=graph_user_id)
+            ok = True
+            _log_bot(
+                INGEST_ACTION_PROACTIVE_FOLLOWUP,
+                "success",
+                ticket_id=int(fu["ticket_id"]),
+                context={"step": fu.get("step")},
+            )
+        except TeamsGraphError as e:
+            logger.warning(f"[followups] Graph falhou para {fu['requester_email']}: {e}")
+            _log_bot(
+                INGEST_ACTION_PROACTIVE_FOLLOWUP,
+                "error",
+                ticket_id=int(fu["ticket_id"]),
+                error_message=str(e),
+                context={"step": fu.get("step")},
+            )
         except Exception as e:
             logger.warning(f"[followups] erro ao enviar para {fu['requester_email']}: {e}")
+            _log_bot(
+                INGEST_ACTION_PROACTIVE_FOLLOWUP,
+                "error",
+                ticket_id=int(fu["ticket_id"]),
+                error_message=str(e),
+                context={"step": fu.get("step")},
+            )
         if ok:
             try:
                 mark_followup_sent(fu["id"])
@@ -528,6 +665,7 @@ async def ingest_movidesk(
 
     # --- auth do webhook ---
     if not WEBHOOK_SHARED_SECRET or t != WEBHOOK_SHARED_SECRET:
+        _log_ingest(INGEST_ACTION_PAYLOAD_RECEIVED, "error", error_message="invalid-shared-secret")
         raise HTTPException(status_code=401, detail="Segredo inválido")
 
     # --- payload ---
@@ -548,6 +686,7 @@ async def ingest_movidesk(
             payload = {}
 
     if not isinstance(payload, dict) or not payload:
+        _log_ingest(INGEST_ACTION_PAYLOAD_RECEIVED, "error", error_message="invalid-payload")
         raise HTTPException(status_code=400, detail="Payload inválido (JSON esperado)")
 
     # aceita Id/id/ticketId/TicketId
@@ -559,9 +698,16 @@ async def ingest_movidesk(
         or "0"
     ))
     if not ticket_id:
+        _log_ingest(INGEST_ACTION_PAYLOAD_RECEIVED, "error", error_message="ticket-id-missing")
         raise HTTPException(status_code=400, detail="ID do ticket ausente no payload")
 
     logger.info(f"[INGEST] payload recebido para ticket {ticket_id}: {payload}")
+    _log_ingest(
+        INGEST_ACTION_PAYLOAD_RECEIVED,
+        "success",
+        ticket_id=ticket_id,
+        context={"status": status, "action_count": action_count},
+    )
 
     # =========================
     # TRAVA NA RAIZ (simples)
@@ -572,17 +718,21 @@ async def ingest_movidesk(
     is_first_creation = (status == "novo") and (action_count == 1)
     if not is_first_creation:
         # Ignora quaisquer outros eventos (novas ações, reentregas, etc.)
+        _log_ingest(INGEST_ACTION_SKIP_FLOW, "success", ticket_id=ticket_id, context={"reason": "not-first-creation"})
         return {"ok": True, "skipped": "not-first-creation", "ticket": ticket_id}
 
     # Regra 2: só uma vez por ticket (não notificar novamente)
     global _NOTIFIED_TICKETS
     if ticket_id in _NOTIFIED_TICKETS:
+        _log_ingest(INGEST_ACTION_SKIP_FLOW, "success", ticket_id=ticket_id, context={"reason": "already-notified"})
         return {"ok": True, "skipped": "already-notified", "ticket": ticket_id}
 
     # --- ticket base (a partir daqui só roda para a 1ª criação e ticket ainda não notificado) ---
     try:
         ticket = get_ticket_by_id(ticket_id)
+        _log_ingest(INGEST_ACTION_FETCH_TICKET, "success", ticket_id=ticket_id, context={"origin": ticket.get("origin")})
     except (RetryError, MovideskError) as e:
+        _log_ingest(INGEST_ACTION_FETCH_TICKET, "error", ticket_id=ticket_id, error_message=str(e))
         raise HTTPException(status_code=502, detail=f"Falha ao buscar ticket {ticket_id} na API Movidesk: {e}")
 
     origin_code = ticket.get("origin")
@@ -594,6 +744,13 @@ async def ingest_movidesk(
     is_email = _is_email_channel(ticket)
     matches_account = _email_to_matches(ticket)
     allowed = bool(is_email and matches_account)
+    if not allowed:
+        _log_ingest(
+            INGEST_ACTION_SKIP_FLOW,
+            "success",
+            ticket_id=ticket_id,
+            context={"reason": "channel-not-allowed", "origin": origin_code},
+        )
 
     # --- conteúdo para classificar ---
     try:
@@ -637,6 +794,12 @@ async def ingest_movidesk(
                         n1_candidate = bool(raw_candidate and not llm_admin and float(llm_conf) >= 0.55)
                     except Exception:
                         n1_candidate = bool(raw_candidate and not llm_admin)
+                _log_ingest(
+                    INGEST_ACTION_CLASSIFY_TICKET_LLM,
+                    "success",
+                    ticket_id=ticket_id,
+                    context={"confidence": llm_conf, "admin_required": llm_admin},
+                )
             else:
                 clf = classify_from_subject(subj)
                 raw_candidate = _get_first(clf, "auto_solve", "auto", "n1_candidate", default=False)
@@ -646,8 +809,15 @@ async def ingest_movidesk(
                 suggested_service = _get_first(clf, "service", "suggested_service", default=None)
                 suggested_category = _get_first(clf, "category", "suggested_category", default=None)
                 suggested_urgency = _get_first(clf, "urgency", "suggested_urgency", default="Média")
+                _log_ingest(
+                    INGEST_ACTION_CLASSIFY_TICKET_FALLBACK,
+                    "success",
+                    ticket_id=ticket_id,
+                    context={"rule": "subject"},
+                )
         except Exception as e:
             logger.warning(f"[INGEST] falha na classificação: {e}")
+            _log_ingest(INGEST_ACTION_CLASSIFY_TICKET_LLM, "error", ticket_id=ticket_id, error_message=str(e))
             try:
                 clf = classify_from_subject(subj)
                 raw_candidate = _get_first(clf, "auto_solve", "auto", "n1_candidate", default=False)
@@ -657,27 +827,49 @@ async def ingest_movidesk(
                 suggested_service = _get_first(clf, "service", "suggested_service", default=None)
                 suggested_category = _get_first(clf, "category", "suggested_category", default=None)
                 suggested_urgency = _get_first(clf, "urgency", "suggested_urgency", default="Média")
+                _log_ingest(
+                    INGEST_ACTION_CLASSIFY_TICKET_FALLBACK,
+                    "success",
+                    ticket_id=ticket_id,
+                    context={"rule": "fallback-after-error"},
+                )
             except Exception as e2:
                 logger.warning(f"[INGEST] fallback simples também falhou: {e2}")
                 n1_candidate = False
                 n1_reason = "[erro] classificação indisponível"
                 suggested_urgency = "Média"
+                _log_ingest(
+                    INGEST_ACTION_CLASSIFY_TICKET_FALLBACK,
+                    "error",
+                    ticket_id=ticket_id,
+                    error_message=str(e2),
+                )
 
     # --- persistência p/ auditoria ---
-    upsert_ticket(
-        ticket_id=ticket_id,
-        allowed=allowed,
-        subject=subj or subject or f"Ticket #{ticket_id}",
-        requester_email=requester_email,
-        origin_email_account=origin_email_account,
-        n1_candidate=n1_candidate,
-        n1_reason=n1_reason,
-        suggested_service=suggested_service,
-        suggested_category=suggested_category,
-        suggested_urgency=suggested_urgency,
-        llm_confidence=llm_conf,
-        llm_admin_required=int(llm_admin),
-    )
+    try:
+        upsert_ticket(
+            ticket_id=ticket_id,
+            allowed=allowed,
+            subject=subj or subject or f"Ticket #{ticket_id}",
+            requester_email=requester_email,
+            origin_email_account=origin_email_account,
+            n1_candidate=n1_candidate,
+            n1_reason=n1_reason,
+            suggested_service=suggested_service,
+            suggested_category=suggested_category,
+            suggested_urgency=suggested_urgency,
+            llm_confidence=llm_conf,
+            llm_admin_required=int(llm_admin),
+        )
+        _log_ingest(
+            INGEST_ACTION_UPSERT_TICKET,
+            "success",
+            ticket_id=ticket_id,
+            context={"allowed": allowed},
+        )
+    except Exception as e:
+        _log_ingest(INGEST_ACTION_UPSERT_TICKET, "error", ticket_id=ticket_id, error_message=str(e))
+        raise
 
     # --- notificação proativa no Teams + followups (somente o SOLICITANTE) ---
     notified = False
@@ -685,8 +877,16 @@ async def ingest_movidesk(
         try:
             preview = f"Olá! Recebemos seu chamado #{ticket_id} sobre \"{subj or subject}\". Podemos iniciar o atendimento agora?"
             # notifica EXCLUSIVAMENTE o e-mail do solicitante
-            notify_user_for_ticket(requester_email, ticket_id, subj or f"Ticket #{ticket_id}", preview_text=preview)
+            graph_user_id = notify_user_for_ticket(requester_email, ticket_id, subj or f"Ticket #{ticket_id}", preview_text=preview)
             notified = True
+            if graph_user_id:
+                set_user_current_ticket(requester_email, ticket_id, teams_user_id=graph_user_id)
+            _log_ingest(
+                INGEST_ACTION_NOTIFY_TEAMS,
+                "success",
+                ticket_id=ticket_id,
+                context={"requester_email": requester_email},
+            )
 
             # marca para não notificar novamente este ticket
             _NOTIFIED_TICKETS.add(ticket_id)
@@ -699,11 +899,14 @@ async def ingest_movidesk(
             try:
                 if not _followups_already_scheduled(ticket_id):
                     schedule_proactive_flow(ticket_id, requester_email, subj or subject or f"Ticket #{ticket_id}")
+                    _log_ingest(INGEST_ACTION_SCHEDULE_FOLLOWUP, "success", ticket_id=ticket_id)
             except Exception as e:
                 logger.warning(f"[INGEST] não consegui agendar followups do ticket {ticket_id}: {e}")
+                _log_ingest(INGEST_ACTION_SCHEDULE_FOLLOWUP, "error", ticket_id=ticket_id, error_message=str(e))
 
         except TeamsGraphError as e:
             logger.warning(f"[TEAMS] falha ao notificar usuário {requester_email} para ticket {ticket_id}: {e}")
+            _log_ingest(INGEST_ACTION_NOTIFY_TEAMS, "error", ticket_id=ticket_id, error_message=str(e))
 
     # --- resposta ---
     return {
@@ -813,7 +1016,9 @@ def debug_ping_teams(body: PingBody, dry: bool = Query(False, description="se tr
         if dry:
             return {"ok": True, "dry": True, "notified": user_email, "ticketId": rec["ticket_id"], "subject": subject, "fromDb": True}
         try:
-            notify_user_for_ticket(user_email, rec["ticket_id"], subject)
+            graph_user_id = notify_user_for_ticket(user_email, rec["ticket_id"], subject)
+            if graph_user_id:
+                set_user_current_ticket(user_email, rec["ticket_id"], teams_user_id=graph_user_id)
             return {"ok": True, "notified": user_email, "ticketId": rec["ticket_id"], "subject": subject, "fromDb": True}
         except TeamsGraphError as e:
             raise HTTPException(status_code=502, detail=str(e))
@@ -838,7 +1043,9 @@ def debug_ping_teams(body: PingBody, dry: bool = Query(False, description="se tr
         return {"ok": True, "dry": True, "notified": user_email, "ticketId": body.id, "subject": subject, "fromDb": from_db}
 
     try:
-        notify_user_for_ticket(user_email, body.id, subject)
+        graph_user_id = notify_user_for_ticket(user_email, body.id, subject)
+        if graph_user_id:
+            set_user_current_ticket(user_email, body.id, teams_user_id=graph_user_id)
         return {"ok": True, "notified": user_email, "ticketId": body.id, "subject": subject, "fromDb": from_db}
     except TeamsGraphError as e:
         raise HTTPException(status_code=502, detail=str(e))

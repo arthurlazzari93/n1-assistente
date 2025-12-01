@@ -351,7 +351,7 @@ def _run_coro_bg(coro) -> None:
 
 # ---------------- API pública principal ----------------
 
-def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str, preview_text: Optional[str] = None) -> None:
+def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str, preview_text: Optional[str] = None) -> Optional[str]:
     user = get_user_by_email(user_email)
     user_id = user.get("id")
     if not user_id:
@@ -371,6 +371,7 @@ def notify_user_for_ticket(user_email: str, ticket_id: int, subject: str, previe
 
     # 👇 antes: asyncio.run(...). Agora: seguro em endpoints async.
     _run_coro_bg(send_proactive_via_bot(user_id, tenant_id, text))
+    return user_id
 
 
 def send_proactive_message(user_email: str, text: str) -> bool:

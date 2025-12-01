@@ -31,14 +31,27 @@ _LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 _CLIENT = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
 
 # ---- Intents suportadas (podemos expandir sem quebrar) ----
-INTENT_LABELS = [
-    "signature.generate",     # gerar/ criar assinatura (PNG)
-    "signature.configure",    # configurar assinatura no Outlook
-    "password.reset",         # reset de senha (AD/Windows/Email)
-    "outlook.issue",          # problemas gerais no Outlook
-    "vpn.access",             # acesso VPN
-    "other"
-]
+INTENT_DESCRIPTIONS = {
+    "signature.generate": "Gerar/baixar imagem da assinatura corporativa.",
+    "signature.configure": "Configurar assinatura no Outlook (novo ou classico).",
+    "password.reset": "Resetar senha de AD/Windows/E-mail ou conta bloqueada por senha incorreta.",
+    "outlook.issue": "Problemas gerais no Outlook (UI, travamentos, sem relacao com entrega).",
+    "email.delivery_issue": "Conta nao envia/recebe, mensagens ficam na caixa de saida ou retornam.",
+    "email.access_blocked": "Usuario com senha correta mas caixa bloqueada/licenca desativada/MFA pendente.",
+    "vpn.access": "Conexao/autenticacao VPN (GlobalProtect, FortiClient, etc.).",
+    "onedrive.sync_issue": "Sincronizacao OneDrive/SharePoint presa ou arquivos com status amarelo.",
+    "sharepoint.permission_issue": "Sem acesso/permissao em sites ou bibliotecas SharePoint.",
+    "printer.install_driver": "Implantacao de impressora, mapeamento e drivers.",
+    "printer.queue_stuck": "Fila/spool travados, trabalhos presos ou duplicados.",
+    "internal_system.access": "Acesso/perfil em sistemas internos (ERP, CRM, SISLOC, SAP, TOTVS...).",
+    "other": "Fallback genérico para itens fora da taxonomia.",
+}
+INTENT_LABELS = list(INTENT_DESCRIPTIONS.keys())
+# Resumo da evolucao da taxonomia/KB:
+# - Novas intents para OneDrive/SharePoint, impressoras, sistemas internos e e-mail corporativo.
+# - KB expandida com: onedrive_sincronizacao.md, sharepoint_permissoes.md,
+#   impressora_instalacao_driver.md, impressora_fila_travada.md,
+#   sistema_erp_acesso.md, email_envio_recebimento.md e email_acesso_bloqueado.md.
 
 SYSTEM_PROMPT = """
 Você é um Agente de Suporte N1 da Tecnogera.
@@ -114,16 +127,47 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
 def _classify_intent_heuristic(text: str) -> Dict[str, Any]:
     """Fallback leve em PT-BR quando não houver LLM."""
     t = (text or "").lower()
-    if "assinatura" in t and any(x in t for x in ("criar", "gerar", "png", "imagem")):
+
+    def has_any(*needles: str) -> bool:
+        return any(n in t for n in needles if n)
+
+    email_context = has_any("e-mail", "email", "mailbox", "outlook")
+    email_blocked = email_context and has_any("bloque", "suspens", "licenc", "mfa", "autenticação", "conta desativada")
+
+    if "assinatura" in t and has_any("criar", "gerar", "png", "imagem"):
         return {"intent": "signature.generate", "confidence": 0.65}
-    if "assinatura" in t and any(x in t for x in ("configurar", "outlook", "opções", "options", "novo", "clássico")):
+    if "assinatura" in t and has_any("configurar", "outlook", "opções", "options", "novo", "clássico"):
         return {"intent": "signature.configure", "confidence": 0.6}
-    if any(x in t for x in ("reset", "redefinir", "esqueci", "senha", "password")):
+    if has_any("reset", "redefinir", "esqueci", "senha", "password"):
+        if email_blocked:
+            return {"intent": "email.access_blocked", "confidence": 0.6}
         return {"intent": "password.reset", "confidence": 0.6}
-    if "vpn" in t:
+
+    if has_any("onedrive", "one drive", "sharepoint"):
+        if has_any("sincron", "sync", "pendente", "travado", "ícone amarelo", "status amarelo", "upload", "arquivos em espera"):
+            return {"intent": "onedrive.sync_issue", "confidence": 0.62}
+        if has_any("permiss", "acesso", "compartilh", "liberar", "site", "biblioteca"):
+            return {"intent": "sharepoint.permission_issue", "confidence": 0.58}
+
+    if has_any("impressora", "printer", "multifuncional"):
+        if has_any("instal", "driver", "deploy", "mapear", "adicionar", "instalar impressora"):
+            return {"intent": "printer.install_driver", "confidence": 0.6}
+        if has_any("fila", "spool", "trav", "spooler", "limpar fila", "cancelar fila", "fila presa", "reiniciar spool"):
+            return {"intent": "printer.queue_stuck", "confidence": 0.58}
+
+    if has_any("erp", "crm", "protheus", "sap", "totvs", "sisloc", "salesforce", "dynamics", "sistema interno", "sistema corporativo"):
+        return {"intent": "internal_system.access", "confidence": 0.6}
+
+    if has_any("vpn"):
         return {"intent": "vpn.access", "confidence": 0.55}
-    if "outlook" in t:
+
+    if email_context:
+        if email_blocked:
+            return {"intent": "email.access_blocked", "confidence": 0.58}
+        if has_any("não envia", "nao envia", "não recebe", "nao recebe", "retorna", "bounce", "caixa de saída", "caixa de saida", "outbox", "fila"):
+            return {"intent": "email.delivery_issue", "confidence": 0.55}
         return {"intent": "outlook.issue", "confidence": 0.5}
+
     return {"intent": "other", "confidence": 0.4}
 
 
@@ -136,9 +180,11 @@ def classify_intent(text: str) -> Dict[str, Any]:
     if not _CLIENT:
         return _classify_intent_heuristic(text)
 
+    intent_lines = "\n".join(f"- {label}: {desc}" for label, desc in INTENT_DESCRIPTIONS.items())
     user_prompt = (
-        "Classifique o pedido abaixo em uma das intenções.\n"
-        f"Valores válidos: {', '.join(INTENT_LABELS)}\n"
+        "Classifique o pedido abaixo na intent mais específica disponível.\n"
+        "Use 'other' apenas quando nenhuma descrição abaixo fizer sentido.\n"
+        f"Intents disponíveis:\n{intent_lines}\n\n"
         "Responda em JSON: {\"intent\": \"<label>\", \"confidence\": 0.0..1.0}\n\n"
         f"Texto:\n{text}"
     )

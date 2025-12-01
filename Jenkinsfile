@@ -13,6 +13,35 @@ pipeline {
       steps { checkout scm } // usa credencial do SCM configurada no Job (PAT como Username/Password)
     }
 
+    stage('Tests (backend)') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          python3 -m venv .venv-ci
+          . .venv-ci/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m unittest
+        '''
+      }
+    }
+
+    stage('Frontend Build') {
+      steps {
+        dir('frontend') {
+          sh '''
+            set -euxo pipefail
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+            npm run build
+          '''
+        }
+      }
+    }
+
     stage('Build image') {
       steps {
         sh '''

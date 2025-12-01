@@ -8,6 +8,23 @@ from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.getenv("DB_PATH", "n1agent.db")
 
+# ---------- Constantes de telemetria (usadas futuramente em /debug/metrics) ----------
+# Sources padronizados para eventos de ingestão.
+INGEST_SOURCE_MOVIDESK_WEBHOOK = "movidesk_webhook"
+INGEST_SOURCE_MOVIDESK_MANUAL = "movidesk_manual"
+INGEST_SOURCE_TEAMS_BOT = "teams_bot"
+
+# Ações padronizadas (ação = etapa dentro do fluxo). Expanda com cautela.
+INGEST_ACTION_PAYLOAD_RECEIVED = "payload_received"
+INGEST_ACTION_FETCH_TICKET = "fetch_ticket"
+INGEST_ACTION_CLASSIFY_TICKET_LLM = "classify_ticket_llm"
+INGEST_ACTION_CLASSIFY_TICKET_FALLBACK = "classify_ticket_fallback"
+INGEST_ACTION_UPSERT_TICKET = "upsert_ticket"
+INGEST_ACTION_SCHEDULE_FOLLOWUP = "schedule_followup"
+INGEST_ACTION_NOTIFY_TEAMS = "notify_user_teams"
+INGEST_ACTION_SKIP_FLOW = "skip_flow"
+INGEST_ACTION_PROACTIVE_FOLLOWUP = "proactive_followup"
+
 
 # ---------------- utils ----------------
 
@@ -22,6 +39,10 @@ def connect():
         yield conn
     finally:
         conn.close()
+
+
+def _normalize_email(email: str | None) -> str:
+    return (email or "").strip().lower()
 
 
 # ---------------- bootstrap ----------------
@@ -73,6 +94,43 @@ def _ensure_followups_table(cur: sqlite3.Cursor):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_followups_state_next ON ticket_followups(state, next_run_at);")
 
 
+def _ensure_user_context_table(cur: sqlite3.Cursor):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_ticket_context (
+            user_email TEXT PRIMARY KEY,
+            current_ticket_id INTEGER,
+            teams_user_id TEXT,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_ctx_teams ON user_ticket_context(teams_user_id);")
+
+
+def _ensure_ingest_events_table(cur: sqlite3.Cursor):
+    """
+    Tabela leve para registrar eventos da ingestão Movidesk.
+    Servirá como base para o endpoint /debug/metrics em tarefa futura.
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingest_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,      -- success | error
+            ticket_id TEXT,
+            error_message TEXT,
+            context TEXT
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_events_source_action ON ingest_events(source, action);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_events_ts ON ingest_events(ts);")
+
+
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -101,6 +159,8 @@ def init_db():
         )
         _ensure_columns_tickets(cur)
         _ensure_followups_table(cur)
+        _ensure_user_context_table(cur)
+        _ensure_ingest_events_table(cur)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_allowed ON tickets_ingestion(allowed);")
         conn.commit()
 
@@ -316,3 +376,319 @@ def mark_followup_sent(fu_id: int):
             (_utc_now(), fu_id),
         )
         conn.commit()
+
+
+# ---------------- Telemetria de ingestão (base para /debug/metrics) ----------------
+
+def log_ingest_event(
+    source: str,
+    action: str,
+    status: str,
+    ticket_id: str | int | None = None,
+    error_message: str | None = None,
+    context: dict | list | str | None = None,
+):
+    """
+    Registra um evento simples relacionado à ingestão Movidesk.
+    Não lança exceção para o caller; quem usa deve tratar erros externos.
+    """
+    ts = _utc_now()
+    ctx_serialized: str | None = None
+    if isinstance(context, (dict, list)):
+        try:
+            ctx_serialized = json.dumps(context, ensure_ascii=False)
+        except Exception:
+            ctx_serialized = str(context)
+    elif context is not None:
+        ctx_serialized = str(context)
+
+    ticket_str = str(ticket_id) if ticket_id is not None else None
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ingest_events (ts, source, action, status, ticket_id, error_message, context)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                ts,
+                source,
+                action,
+                status,
+                ticket_str,
+                error_message,
+                ctx_serialized,
+            ),
+        )
+        conn.commit()
+
+
+def _decode_context(raw: str | None):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def get_ingest_metrics(window_hours: int = 24, recent_limit: int = 100, error_limit: int = 20) -> dict:
+    """
+    Retorna métricas simples da tabela ingest_events.
+    Útil para o endpoint /debug/metrics.
+    """
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    data: dict = {
+        "recent_events": [],
+        "window": {
+            "since": window_start,
+            "total_events": 0,
+            "by_status": {},
+            "by_action": {},
+            "recent_errors": [],
+        },
+    }
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts, source, action, status, ticket_id, error_message, context
+              FROM ingest_events
+             ORDER BY id DESC
+             LIMIT ?;
+            """,
+            (recent_limit,),
+        )
+        for row in cur.fetchall():
+            data["recent_events"].append(
+                {
+                    "ts": row[0],
+                    "source": row[1],
+                    "action": row[2],
+                    "status": row[3],
+                    "ticket_id": row[4],
+                    "error_message": row[5],
+                    "context": _decode_context(row[6]),
+                }
+            )
+
+        cur.execute(
+            "SELECT status, COUNT(1) FROM ingest_events WHERE ts >= ? GROUP BY status;",
+            (window_start,),
+        )
+        for status, count in cur.fetchall():
+            data["window"]["by_status"][status] = count
+            data["window"]["total_events"] += count
+
+        cur.execute(
+            """
+            SELECT action, status, COUNT(1)
+              FROM ingest_events
+             WHERE ts >= ?
+          GROUP BY action, status;
+            """,
+            (window_start,),
+        )
+        for action, status, count in cur.fetchall():
+            per_action = data["window"]["by_action"].setdefault(action, {"success": 0, "error": 0})
+            per_action[status] = count
+
+        cur.execute(
+            """
+            SELECT ts, source, action, ticket_id, error_message
+              FROM ingest_events
+             WHERE status='error'
+             ORDER BY id DESC
+             LIMIT ?;
+            """,
+            (error_limit,),
+        )
+        for row in cur.fetchall():
+            data["window"]["recent_errors"].append(
+                {
+                    "ts": row[0],
+                    "source": row[1],
+                    "action": row[2],
+                    "ticket_id": row[3],
+                    "error_message": row[4],
+                }
+            )
+    return data
+
+
+def get_followup_metrics() -> dict:
+    """
+    Resumo do estado dos follow-ups (pendentes/enviados/cancelados) + próximo vencimento.
+    """
+    metrics = {"by_status": {}, "pending_total": 0, "next_due": None}
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT state, COUNT(1) FROM ticket_followups GROUP BY state;")
+        for state, count in cur.fetchall():
+            metrics["by_status"][state] = count
+            if state == "pending":
+                metrics["pending_total"] = count
+        cur.execute(
+            """
+            SELECT next_run_at
+              FROM ticket_followups
+             WHERE state='pending'
+             ORDER BY next_run_at ASC
+             LIMIT 1;
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            metrics["next_due"] = row[0]
+    return metrics
+
+
+def get_recent_tickets(limit: int = 20) -> list[dict]:
+    """
+    Retorna tickets mais recentes registrados em tickets_ingestion.
+    """
+    items: list[dict] = []
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticket_id, first_seen_at, last_seen_at, allowed, requester_email,
+                   subject, origin_email_account, teams_notified, n1_candidate, n1_reason
+              FROM tickets_ingestion
+          ORDER BY last_seen_at DESC
+             LIMIT ?;
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            items.append(
+                {
+                    "ticket_id": row[0],
+                    "first_seen_at": row[1],
+                    "last_seen_at": row[2],
+                    "allowed": bool(row[3]),
+                    "requester_email": row[4],
+                    "subject": row[5],
+                    "origin_email_account": row[6],
+                    "teams_notified": bool(row[7]),
+                    "n1_candidate": bool(row[8]) if row[8] is not None else None,
+                    "n1_reason": row[9],
+                }
+            )
+    return items
+
+
+def set_user_current_ticket(user_email: str, ticket_id: int | None, teams_user_id: str | None = None) -> None:
+    email = _normalize_email(user_email)
+    if not email:
+        return
+    now = _utc_now()
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_email FROM user_ticket_context WHERE user_email=?;", (email,))
+        exists = cur.fetchone() is not None
+        if exists:
+            if teams_user_id is not None:
+                cur.execute(
+                    """
+                    UPDATE user_ticket_context
+                       SET current_ticket_id=?,
+                           teams_user_id=?,
+                           updated_at=?
+                     WHERE user_email=?;
+                    """,
+                    (ticket_id, teams_user_id, now, email),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE user_ticket_context
+                       SET current_ticket_id=?,
+                           updated_at=?
+                     WHERE user_email=?;
+                    """,
+                    (ticket_id, now, email),
+                )
+        else:
+            cur.execute(
+                """
+                INSERT INTO user_ticket_context (user_email, current_ticket_id, teams_user_id, updated_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                (email, ticket_id, teams_user_id, now),
+            )
+        conn.commit()
+
+
+def get_user_context(user_email: str) -> dict | None:
+    email = _normalize_email(user_email)
+    if not email:
+        return None
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_email, current_ticket_id, teams_user_id, updated_at FROM user_ticket_context WHERE user_email=?;",
+            (email,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "user_email": row[0],
+            "current_ticket_id": row[1],
+            "teams_user_id": row[2],
+            "updated_at": row[3],
+        }
+
+
+def get_user_context_by_teams_id(teams_user_id: str) -> dict | None:
+    if not teams_user_id:
+        return None
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_email, current_ticket_id, teams_user_id, updated_at FROM user_ticket_context WHERE teams_user_id=?;",
+            (teams_user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "user_email": row[0],
+            "current_ticket_id": row[1],
+            "teams_user_id": row[2],
+            "updated_at": row[3],
+        }
+
+
+def list_tickets_for_requester(user_email: str, limit: int = 5) -> list[dict]:
+    email = _normalize_email(user_email)
+    if not email:
+        return []
+    items: list[dict] = []
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticket_id, subject, last_seen_at, n1_reason, teams_notified, allowed
+              FROM tickets_ingestion
+             WHERE LOWER(COALESCE(requester_email, '')) = ?
+          ORDER BY last_seen_at DESC
+             LIMIT ?;
+            """,
+            (email, limit),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            items.append(
+                {
+                    "ticket_id": row[0],
+                    "subject": row[1],
+                    "last_seen_at": row[2],
+                    "n1_reason": row[3],
+                    "teams_notified": bool(row[4]),
+                    "allowed": bool(row[5]),
+                }
+            )
+    return items

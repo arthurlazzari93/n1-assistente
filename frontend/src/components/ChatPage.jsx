@@ -1,5 +1,49 @@
 import React, { useEffect, useRef, useState } from "react";
 
+const SEEDS = [
+  {
+    id: "onedrive_sync",
+    title: "OneDrive não sincroniza",
+    subject: "OneDrive preso sincronizando biblioteca Projetos",
+    description:
+      "Usuário relata que a pasta Documentos fica com ícone amarelo e mensagem 'Processando alterações' há horas. Precisa liberar espaço para enviar relatório."
+  },
+  {
+    id: "sharepoint_perms",
+    title: "Sem acesso SharePoint",
+    subject: "Erro de permissão ao abrir site financeiro",
+    description:
+      "Ao abrir o site https://contoso.sharepoint.com/sites/Financeiro o usuário recebe 'Acesso negado' mesmo estando no grupo da área."
+  },
+  {
+    id: "printer_queue",
+    title: "Fila de impressora travada",
+    subject: "Fila da impressora HP-LaserFinance parada",
+    description:
+      "Impressora do Financeiro parou, há vários documentos 'Em impressão'. Reiniciar spooler não resolveu. Usuário precisa limpar fila."
+  },
+  {
+    id: "erp_access",
+    title: "ERP nega acesso",
+    subject: "Usuário sem perfil no ERP TOTVS",
+    description:
+      "Usuário não consegue acessar menu financeiro no ERP TOTVS, mensagem: usuário sem permissão. Precisa liberar acesso urgente."
+  },
+  {
+    id: "email_delivery",
+    title: "Email externo não chega",
+    subject: "Clientes não conseguem enviar email para suporte",
+    description:
+      "Clientes reportam que os e-mails enviados para suporte@empresa.com retornam com erro 550. Internamente funciona."
+  },
+  {
+    id: "other_generic",
+    title: "Cenário genérico",
+    subject: "Duvida sobre política interna",
+    description: "Usuário pergunta quais são os horários de funcionamento da TI. Não há ticket claro."
+  }
+];
+
 const initialBanner = {
   role: "system",
   text: "Converse livremente com o agente para avaliar o fluxo de triagem, uso da KB e parâmetros da IA."
@@ -18,6 +62,14 @@ function ChatPage({ onResetSession }) {
   });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [lastRequest, setLastRequest] = useState(null);
+  const [lastResponse, setLastResponse] = useState(null);
+  const [showLogs, setShowLogs] = useState(false);
+  const [activeLogTab, setActiveLogTab] = useState("request");
+  const [selectedSeed, setSelectedSeed] = useState(null);
+  const [metricsSummary, setMetricsSummary] = useState(null);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsError, setMetricsError] = useState("");
 
   const chatRef = useRef(null);
 
@@ -28,23 +80,27 @@ function ChatPage({ onResetSession }) {
   }, [history, loading]);
 
   const callAgent = async (historyPayload) => {
+    const payload = {
+      ticket: {
+        subject: subject.trim(),
+        description: description.trim()
+      },
+      history: historyPayload
+    };
+    setLastRequest(payload);
     const res = await fetch("/debug/chat/triage", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ticket: {
-          subject: subject.trim(),
-          description: description.trim()
-        },
-        history: historyPayload
-      })
+      body: JSON.stringify(payload)
     });
 
     if (!res.ok) {
       throw new Error(`Falha ao chamar /debug/chat/triage (${res.status})`);
     }
 
-    return res.json();
+    const data = await res.json();
+    setLastResponse(data);
+    return data;
   };
 
   const handleSend = async () => {
@@ -135,6 +191,10 @@ function ChatPage({ onResetSession }) {
     setError("");
     setMessage("");
     setSessionStarted(false);
+    setLastRequest(null);
+    setLastResponse(null);
+    setSelectedSeed(null);
+    setMetricsSummary(null);
     if (typeof onResetSession === "function") {
       onResetSession();
     }
@@ -146,6 +206,54 @@ function ChatPage({ onResetSession }) {
       handleSend();
     }
   };
+
+  const handleSeedSelect = (seed) => {
+    setSubject(seed.subject);
+    setDescription(seed.description);
+    setSelectedSeed(seed.id);
+    setSessionStarted(false);
+    setHistory([]);
+    setMetrics({ action: null, intent: null, confidence: null });
+  };
+
+  const handleCopyJson = (type) => {
+    const payload = type === "request" ? lastRequest : lastResponse;
+    if (!payload) return;
+    navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+  };
+
+  const fetchMetrics = async () => {
+    setMetricsLoading(true);
+    setMetricsError("");
+    try {
+      const res = await fetch("/debug/metrics");
+      if (!res.ok) {
+        throw new Error(`Falha ao obter métricas (${res.status})`);
+      }
+      const data = await res.json();
+      setMetricsSummary(data);
+    } catch (err) {
+      console.error(err);
+      setMetricsError("Não foi possível carregar as métricas.");
+    } finally {
+      setMetricsLoading(false);
+    }
+  };
+
+  const renderLogContent = () => {
+    const target = activeLogTab === "request" ? lastRequest : lastResponse;
+    if (!target) {
+      return <div className="logs-empty">Sem dados ainda.</div>;
+    }
+    return (
+      <pre className="logs-json">
+        {JSON.stringify(target, null, 2)}
+      </pre>
+    );
+  };
+
+  const ingestWindow = metricsSummary?.ingest?.window;
+  const followSummary = metricsSummary?.followups;
 
   const renderMetrics = () => {
     const { action, intent, confidence } = metrics;
@@ -179,7 +287,7 @@ function ChatPage({ onResetSession }) {
   };
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${showLogs ? "with-logs" : ""}`}>
       <header className="app-header">
         <div className="avatar">N1</div>
         <div className="app-title">
@@ -192,8 +300,22 @@ function ChatPage({ onResetSession }) {
         </div>
       </header>
 
-      <main className="app-main">
+      <main className={`app-main ${showLogs ? "show-logs" : ""}`}>
         <section className="chat-panel">
+          <div className="seed-bar">
+            <div className="seed-label">Seeds rápidos:</div>
+            <div className="seed-buttons">
+              {SEEDS.map((seed) => (
+                <button
+                  key={seed.id}
+                  className={`seed-btn ${selectedSeed === seed.id ? "active" : ""}`}
+                  onClick={() => handleSeedSelect(seed)}
+                >
+                  {seed.title}
+                </button>
+              ))}
+            </div>
+          </div>
           <div ref={chatRef} className="chat-body">
             <div className="system-banner">
               <span className="system-pill">Sessão de teste</span>
@@ -302,6 +424,35 @@ function ChatPage({ onResetSession }) {
               Estes campos simulam o texto do ticket no Movidesk.
             </span>
           </div>
+          <div className="metrics-panel">
+            <div className="metrics-panel__header">
+              <strong>Ferramentas de debug</strong>
+              <div className="metrics-actions">
+                <button className="btn-secondary" onClick={fetchMetrics} disabled={metricsLoading}>
+                  {metricsLoading ? "Carregando..." : "Atualizar métricas"}
+                </button>
+                <label className="logs-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showLogs}
+                    onChange={() => setShowLogs((prev) => !prev)}
+                  />
+                  Mostrar logs JSON
+                </label>
+              </div>
+            </div>
+            {metricsError && <div className="error-banner">{metricsError}</div>}
+            {metricsSummary && (
+              <ul className="metrics-panel__list">
+                <li>
+                  Eventos 24h: {ingestWindow?.total_events ?? "-"} | Erros:{" "}
+                  {ingestWindow?.by_status?.error ?? 0}
+                </li>
+                <li>Follow-ups pendentes: {followSummary?.pending_total ?? 0}</li>
+                <li>Próximo follow-up: {followSummary?.next_due || "—"}</li>
+              </ul>
+            )}
+          </div>
 
           <div className="ctx-group">
             <label>Métricas da última resposta</label>
@@ -310,6 +461,38 @@ function ChatPage({ onResetSession }) {
 
           {error && <div className="error-banner">{error}</div>}
         </aside>
+        {showLogs && (
+          <aside className="logs-panel">
+            <div className="logs-header">
+              <strong>Logs JSON</strong>
+              <div className="logs-tabs">
+                <button
+                  className={activeLogTab === "request" ? "active" : ""}
+                  onClick={() => setActiveLogTab("request")}
+                >
+                  Request
+                </button>
+                <button
+                  className={activeLogTab === "response" ? "active" : ""}
+                  onClick={() => setActiveLogTab("response")}
+                >
+                  Response
+                </button>
+              </div>
+              <button
+                className="btn-secondary btn-copy"
+                onClick={() => handleCopyJson(activeLogTab)}
+                disabled={
+                  (activeLogTab === "request" && !lastRequest) ||
+                  (activeLogTab === "response" && !lastResponse)
+                }
+              >
+                Copiar JSON
+              </button>
+            </div>
+            {renderLogContent()}
+          </aside>
+        )}
       </main>
     </div>
   );
