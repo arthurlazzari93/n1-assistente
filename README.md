@@ -77,6 +77,7 @@ Após configurar o ambiente e o `.env`:
   - `knowledge/` – artigos da base de conhecimento (Markdown).
   - `ai/` – agentes e fluxos de IA.
   - `data/` – dados de feedback/aprendizado (ex.: `feedback_kb.jsonl`).
+- `frontend/` – projeto React + Vite para testar o agente via tela de chat.
 - `teams_app/` – manifestos, ícones e pacotes ZIP do app do Teams.
 - `n1agent.db` – banco SQLite usado pela aplicação.
 - `docker-compose.yml` / `Dockerfile` – artefatos para containerização.
@@ -92,6 +93,31 @@ O fluxo típico é:
 
 Consulte seu pipeline (ex.: `Jenkinsfile`) ou documentação interna para detalhes específicos de deploy.
 
+## Frontend (React + Vite)
+
+O diretório `frontend/` contém um projeto em **React** criado com **Vite**, com uma tela de chat para testar o agente N1 via HTTP.
+
+### Rodando o frontend em desenvolvimento
+
+1. Instale as dependências (na primeira vez):
+   - `cd frontend`
+   - `npm install`
+2. Com o backend já rodando em `http://localhost:8000`:
+   - `npm run dev`
+3. Acesse no navegador:
+   - `http://localhost:5173`
+
+O Vite está configurado para fazer proxy das rotas que começam com `/debug` para `http://localhost:8000`, então o frontend conversa com o endpoint `/debug/chat/triage` sem precisar configurar CORS.
+
+### Build de produção do frontend
+
+Para gerar os artefatos estáticos:
+
+- `cd frontend`
+- `npm run build`
+
+O resultado ficará em `frontend/dist/`. Em um passo posterior, você pode integrar esse build ao FastAPI (por exemplo, servindo os arquivos estáticos a partir de `app/static/` ou de um CDN/reverso).
+
 ## Base de conhecimento em Markdown
 
 Os arquivos em `app/knowledge/` são artigos de ajuda usados pela IA e pelo bot.  
@@ -106,4 +132,3 @@ Para criar novos artigos:
 - Nunca versione `.env` reais ou tokens.
 - Verifique logs (`app.log`) para garantir que erros não exponham segredos.
 - Restrinja o acesso aos endpoints de debug em ambientes de produção (via rede, gateway ou auth).
-

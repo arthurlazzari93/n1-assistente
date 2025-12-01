@@ -9,10 +9,12 @@ import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel
 from tenacity import RetryError
 from app.teams_graph import diag_bot_token
+from app.ai.triage_agent import triage_next
 
 # --- Windows: usar o event loop compatível (evita warnings/erros no BotBuilder)
 if sys.platform.startswith("win"):
@@ -86,6 +88,11 @@ load_dotenv()
 app = FastAPI(title="Assistente N1 - Tecnogera")
 logger.remove()
 logger.add("app.log", rotation="10 MB", retention=5, enqueue=True)
+
+# Arquivos estáticos (front simples para testes)
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # -----------------------------------------------------------------------------#
 # ENV
@@ -219,6 +226,35 @@ def _to_dict_safe(obj):
     except Exception:
         return {"_repr": repr(obj)}
 
+
+class ChatMessage(BaseModel):
+    """Mensagem de chat simples para testar o agente via HTTP."""
+
+    role: str  # "user" ou "assistant"
+    text: str
+
+
+class ChatTicket(BaseModel):
+    """Contexto mínimo de ticket para simulação de atendimento."""
+
+    subject: str = ""
+    description: str = ""
+
+
+class ChatRequest(BaseModel):
+    """Payload do front-end de testes de chat."""
+
+    ticket: ChatTicket
+    history: list[ChatMessage]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    action: str | None = None
+    confidence: float | None = None
+    intent: str | None = None
+
+
 @app.get("/debug/bot/token")
 def debug_bot_token():
     return diag_bot_token()
@@ -230,6 +266,36 @@ def healthz():
 @app.get("/debug/routes")
 def _debug_routes():
     return [getattr(r, "path", str(r)) for r in app.router.routes]
+
+
+@app.post("/debug/chat/triage", response_model=ChatResponse)
+def debug_chat_triage(body: ChatRequest):
+    """
+    Endpoint simples para testar o agente N1 via HTTP.
+    Recebe hist��rico de mensagens + contexto (assunto/descri��ǜo)
+    e retorna a pr��xima resposta sugerida pelo triage_agent.
+    """
+    ticket = {
+        "id": 0,
+        "subject": body.ticket.subject,
+        "first_action_text": body.ticket.description,
+        "description": body.ticket.description,
+    }
+    history = [{"role": m.role, "text": m.text} for m in body.history]
+
+    out = triage_next(history, ticket)
+
+    reply = out.get("message") or "Certo! Vou te guiar. Em qual tela/op��ǜo voc�� est�� agora?"
+    checklist = out.get("checklist") or []
+    if checklist:
+        reply += "\n\n" + "\n".join(f"- {p}" for p in checklist)
+
+    return ChatResponse(
+        reply=reply,
+        action=out.get("action"),
+        confidence=float(out.get("confidence") or 0.0) if out.get("confidence") is not None else None,
+        intent=out.get("intent"),
+    )
 
 @app.get("/debug/bot-info")
 def debug_bot_info():

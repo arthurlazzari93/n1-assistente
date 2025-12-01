@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Assistente N1 - Chat de Testes</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        --bg: #0f172a;
+        --bg-alt: #020617;
+        --panel: #020617;
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.12);
+        --border: #1e293b;
+        --text: #e5e7eb;
+        --text-muted: #9ca3af;
+        --danger: #f97373;
+        --radius-lg: 12px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background: radial-gradient(circle at top, #1f2937, #020617 60%);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        align-items: stretch;
+        justify-content: center;
+        padding: 16px;
+      }
+
+      .app-shell {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        max-width: 1120px;
+        max-height: 720px;
+        background: linear-gradient(135deg, #020617 0%, #020617 30%, #0b1120);
+        border-radius: 24px;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        box-shadow: 0 24px 80px rgba(15, 23, 42, 0.9);
+        overflow: hidden;
+      }
+
+      .app-header {
+        padding: 16px 18px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        background: radial-gradient(circle at top left, #0f172a 0, #020617 55%);
+      }
+
+      .avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 999px;
+        background: radial-gradient(circle at 30% 20%, #38bdf8, #6366f1);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 22px;
+        font-weight: 700;
+        box-shadow: 0 0 0 2px rgba(15, 23, 42, 1);
+      }
+
+      .app-title {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .app-title h1 {
+        margin: 0;
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      .app-title span {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .badge {
+        margin-left: auto;
+        font-size: 11px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(22, 163, 74, 0.1);
+        border: 1px solid rgba(34, 197, 94, 0.5);
+        color: #bbf7d0;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .badge-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: #22c55e;
+        box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.25);
+      }
+
+      .app-main {
+        display: grid;
+        grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.2fr);
+        gap: 0;
+        flex: 1;
+        min-height: 0;
+      }
+
+      .chat-panel {
+        display: flex;
+        flex-direction: column;
+        border-right: 1px solid rgba(148, 163, 184, 0.15);
+      }
+
+      .chat-body {
+        flex: 1;
+        min-height: 0;
+        padding: 14px 16px 8px;
+        overflow-y: auto;
+        background: radial-gradient(
+          circle at top left,
+          rgba(56, 189, 248, 0.08),
+          transparent 45%
+        );
+      }
+
+      .system-banner {
+        border-radius: 999px;
+        padding: 8px 12px;
+        margin-bottom: 12px;
+        font-size: 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        color: var(--text-muted);
+      }
+
+      .system-pill {
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        color: var(--accent);
+      }
+
+      .chat-message {
+        display: flex;
+        margin-bottom: 8px;
+      }
+
+      .chat-message.user {
+        justify-content: flex-end;
+      }
+
+      .chat-bubble {
+        max-width: 78%;
+        padding: 8px 11px;
+        border-radius: 14px;
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      .chat-message.user .chat-bubble {
+        background: linear-gradient(135deg, #38bdf8, #6366f1);
+        color: white;
+        border-bottom-right-radius: 4px;
+      }
+
+      .chat-message.agent .chat-bubble {
+        background: rgba(15, 23, 42, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-bottom-left-radius: 4px;
+      }
+
+      .chat-meta {
+        margin-top: 4px;
+        display: flex;
+        gap: 6px;
+        font-size: 11px;
+        color: var(--text-muted);
+        align-items: center;
+      }
+
+      .meta-pill {
+        padding: 2px 6px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.3);
+      }
+
+      .typing {
+        display: inline-flex;
+        gap: 4px;
+      }
+
+      .typing-dot {
+        width: 4px;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.8);
+        animation: pulse 1.2s infinite ease-in-out;
+      }
+
+      .typing-dot:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+
+      .typing-dot:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 0.25;
+          transform: translateY(0);
+        }
+        50% {
+          opacity: 0.9;
+          transform: translateY(-1px);
+        }
+      }
+
+      .chat-input {
+        padding: 10px 14px;
+        border-top: 1px solid rgba(148, 163, 184, 0.2);
+        background: rgba(15, 23, 42, 0.95);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .chat-input-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .input-box {
+        flex: 1;
+        background: rgba(15, 23, 42, 0.95);
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        display: flex;
+        align-items: center;
+        padding: 2px 10px;
+        gap: 6px;
+      }
+
+      .input-box input {
+        border: none;
+        outline: none;
+        background: transparent;
+        color: var(--text);
+        font-size: 13px;
+        width: 100%;
+      }
+
+      .input-placeholder {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      button {
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        border-radius: 999px;
+        padding: 8px 14px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, #38bdf8, #6366f1);
+        color: white;
+        box-shadow: 0 8px 24px rgba(56, 189, 248, 0.35);
+      }
+
+      .btn-secondary {
+        background: rgba(15, 23, 42, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.5);
+        color: var(--text-muted);
+      }
+
+      .btn-primary:disabled {
+        opacity: 0.6;
+        cursor: default;
+        box-shadow: none;
+      }
+
+      .ctx-panel {
+        padding: 14px 14px 12px;
+        background: radial-gradient(
+          circle at top right,
+          rgba(56, 189, 248, 0.08),
+          transparent 55%
+        );
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .ctx-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 13px;
+      }
+
+      .ctx-header span {
+        color: var(--text-muted);
+        font-size: 12px;
+      }
+
+      .ctx-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      label {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      input[type="text"],
+      textarea {
+        width: 100%;
+        background: rgba(15, 23, 42, 0.92);
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        color: var(--text);
+        padding: 8px 9px;
+        font-size: 12px;
+        outline: none;
+        resize: vertical;
+        min-height: 32px;
+      }
+
+      textarea {
+        min-height: 74px;
+      }
+
+      input[type="text"]::placeholder,
+      textarea::placeholder {
+        color: var(--text-muted);
+      }
+
+      .ctx-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .ctx-footer span {
+        opacity: 0.8;
+      }
+
+      .pill-small {
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.4);
+      }
+
+      .metrics {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 2px;
+      }
+
+      .metric {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .metric strong {
+        color: var(--accent);
+        font-weight: 500;
+      }
+
+      .error-banner {
+        margin-top: 4px;
+        font-size: 11px;
+        color: #fecaca;
+        background: rgba(248, 113, 113, 0.14);
+        border-radius: 8px;
+        padding: 6px 8px;
+        border: 1px solid rgba(248, 113, 113, 0.4);
+      }
+
+      @media (max-width: 900px) {
+        .app-main {
+          grid-template-columns: minmax(0, 1.7fr) minmax(0, 1.3fr);
+        }
+      }
+
+      @media (max-width: 760px) {
+        body {
+          padding: 8px;
+        }
+
+        .app-shell {
+          max-height: none;
+        }
+
+        .app-main {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .chat-panel {
+          border-right: none;
+          border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="avatar">N1</div>
+        <div class="app-title">
+          <h1>Assistente N1 – Sandbox</h1>
+          <span>Simulador de atendimento de chamado (HTTP)</span>
+        </div>
+        <div class="badge">
+          <div class="badge-dot"></div>
+          Online para testes
+        </div>
+      </header>
+
+      <main class="app-main">
+        <section class="chat-panel">
+          <div id="chat-body" class="chat-body">
+            <div class="system-banner">
+              <span class="system-pill">Sessão de teste</span>
+              Converse livremente com o agente para avaliar o fluxo de triagem,
+              uso da KB e parâmetros da IA.
+            </div>
+          </div>
+
+          <div class="chat-input">
+            <div class="chat-input-row">
+              <div class="input-box">
+                <input
+                  id="message-input"
+                  type="text"
+                  autocomplete="off"
+                  placeholder="Descreva o próximo passo ou responda ao agente..."
+                />
+              </div>
+              <button id="send-btn" class="btn-primary">
+                Enviar
+              </button>
+            </div>
+            <div class="chat-input-row" style="justify-content: space-between">
+              <button id="reset-btn" class="btn-secondary">
+                Resetar conversa
+              </button>
+              <div class="input-placeholder">
+                Dica: simule um chamado real e acompanhe como o agente busca na
+                KB e decide os próximos passos.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="ctx-panel">
+          <div class="ctx-header">
+            <div>
+              <strong>Contexto do chamado</strong>
+              <div style="font-size: 11px; color: var(--text-muted)">
+                Defina o assunto e o problema inicial que o agente deve usar.
+              </div>
+            </div>
+          </div>
+
+          <div class="ctx-group">
+            <label for="subject-input">Assunto</label>
+            <input
+              id="subject-input"
+              type="text"
+              placeholder="Ex: Erro ao configurar assinatura no Outlook"
+            />
+          </div>
+
+          <div class="ctx-group">
+            <label for="description-input">Descrição inicial do problema</label>
+            <textarea
+              id="description-input"
+              placeholder="Ex: Usuário relata que a assinatura não aparece ao criar novos e-mails e não encontra a opção nas configurações..."
+            ></textarea>
+          </div>
+
+          <div class="ctx-footer">
+            <span>
+              O agente usa esse contexto como se fosse o texto do ticket no
+              Movidesk.
+            </span>
+          </div>
+
+          <div class="ctx-group">
+            <label>Métricas da última resposta</label>
+            <div class="metrics" id="metrics">
+              <span class="pill-small">Aguardando interação...</span>
+            </div>
+          </div>
+
+          <div id="error" class="error-banner" style="display: none"></div>
+        </aside>
+      </main>
+    </div>
+
+    <script>
+      const chatBody = document.getElementById("chat-body");
+      const messageInput = document.getElementById("message-input");
+      const sendBtn = document.getElementById("send-btn");
+      const resetBtn = document.getElementById("reset-btn");
+      const subjectInput = document.getElementById("subject-input");
+      const descriptionInput = document.getElementById("description-input");
+      const metrics = document.getElementById("metrics");
+      const errorBanner = document.getElementById("error");
+
+      let history = [];
+      let isLoading = false;
+
+      function appendMessage(role, text) {
+        const wrapper = document.createElement("div");
+        wrapper.className = `chat-message ${role}`;
+
+        const bubble = document.createElement("div");
+        bubble.className = "chat-bubble";
+        bubble.textContent = text;
+
+        wrapper.appendChild(bubble);
+        chatBody.appendChild(wrapper);
+        chatBody.scrollTop = chatBody.scrollHeight;
+      }
+
+      function appendTyping() {
+        const wrapper = document.createElement("div");
+        wrapper.className = "chat-message agent";
+        wrapper.id = "typing-indicator";
+
+        const bubble = document.createElement("div");
+        bubble.className = "chat-bubble";
+
+        const typing = document.createElement("div");
+        typing.className = "typing";
+
+        for (let i = 0; i < 3; i++) {
+          const dot = document.createElement("span");
+          dot.className = "typing-dot";
+          typing.appendChild(dot);
+        }
+
+        bubble.appendChild(typing);
+        wrapper.appendChild(bubble);
+        chatBody.appendChild(wrapper);
+        chatBody.scrollTop = chatBody.scrollHeight;
+      }
+
+      function removeTyping() {
+        const t = document.getElementById("typing-indicator");
+        if (t) t.remove();
+      }
+
+      function setLoading(value) {
+        isLoading = value;
+        sendBtn.disabled = value;
+        if (value) {
+          appendTyping();
+        } else {
+          removeTyping();
+        }
+      }
+
+      function updateMetrics({ action, confidence, intent }) {
+        metrics.innerHTML = "";
+
+        if (!action && !intent && confidence == null) {
+          const span = document.createElement("span");
+          span.className = "pill-small";
+          span.textContent = "Aguardando interação...";
+          metrics.appendChild(span);
+          return;
+        }
+
+        if (intent) {
+          const m = document.createElement("span");
+          m.className = "metric";
+          m.innerHTML = `<strong>Intent</strong> ${intent}`;
+          metrics.appendChild(m);
+        }
+
+        if (action) {
+          const m = document.createElement("span");
+          m.className = "metric";
+          m.innerHTML = `<strong>Ação</strong> ${action}`;
+          metrics.appendChild(m);
+        }
+
+        if (confidence != null) {
+          const m = document.createElement("span");
+          m.className = "metric";
+          const pct = Math.round(confidence * 100);
+          m.innerHTML = `<strong>Confiança</strong> ${pct}%`;
+          metrics.appendChild(m);
+        }
+      }
+
+      function showError(msg) {
+        errorBanner.textContent = msg;
+        errorBanner.style.display = "block";
+      }
+
+      function clearError() {
+        errorBanner.style.display = "none";
+      }
+
+      async function sendMessage() {
+        if (isLoading) return;
+        clearError();
+
+        const text = messageInput.value.trim();
+        if (!text) return;
+
+        const subject = subjectInput.value.trim();
+        const description = descriptionInput.value.trim();
+
+        if (!subject && !description) {
+          showError(
+            "Defina pelo menos um assunto ou uma descrição inicial do chamado antes de conversar com o agente."
+          );
+          return;
+        }
+
+        // Mostra mensagem do usuário no chat
+        appendMessage("user", text);
+        history.push({ role: "user", text });
+        messageInput.value = "";
+
+        setLoading(true);
+
+        try {
+          const res = await fetch("/debug/chat/triage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ticket: {
+                subject,
+                description,
+              },
+              history,
+            }),
+          });
+
+          if (!res.ok) {
+            throw new Error(
+              "Falha ao chamar o endpoint /debug/chat/triage (" +
+                res.status +
+                ")"
+            );
+          }
+
+          const data = await res.json();
+          const reply = data.reply || "(sem resposta)";
+
+          history.push({ role: "assistant", text: reply });
+          appendMessage("agent", reply);
+          updateMetrics({
+            action: data.action,
+            confidence: data.confidence,
+            intent: data.intent,
+          });
+        } catch (err) {
+          console.error(err);
+          showError(
+            "Erro ao conversar com o agente. Verifique se a API está rodando e se o endpoint /debug/chat/triage está acessível."
+          );
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      function resetConversation() {
+        history = [];
+        chatBody.innerHTML = `
+          <div class="system-banner">
+            <span class="system-pill">Sessão de teste</span>
+            Converse livremente com o agente para avaliar o fluxo de triagem,
+            uso da KB e parâmetros da IA.
+          </div>
+        `;
+        updateMetrics({ action: null, intent: null, confidence: null });
+        clearError();
+        messageInput.value = "";
+      }
+
+      sendBtn.addEventListener("click", () => {
+        sendMessage();
+      });
+
+      messageInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      resetBtn.addEventListener("click", () => {
+        resetConversation();
+      });
+
+      // Estado inicial
+      updateMetrics({ action: null, intent: null, confidence: null });
+    </script>
+  </body>
+</html>
+
