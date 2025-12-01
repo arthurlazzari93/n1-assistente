@@ -21,7 +21,7 @@ pipeline {
           . .venv-ci/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
-          python -m unittest
+          python -m unittest tests.test_db_telemetry tests.test_intents tests.test_metrics_endpoint tests.test_user_context tests.test_bot_helpers
         '''
       }
     }

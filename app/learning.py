@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from loguru import logger
@@ -40,6 +40,12 @@ class FeedbackEvent:
 
 
 _LOCK = threading.Lock()
+
+
+def _success_rate(success: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return round(float(success) / float(total), 4)
 
 
 # === Funções utilitárias de IO ===
@@ -186,6 +192,152 @@ def get_global_stats(half_life_days: float = 90.0) -> Dict[str, float]:
         "events_count": len(events),
     }
 
+
+def get_feedback_metrics(
+    top_docs: int = 5,
+    max_recent: int = 30,
+    half_life_days: float = 90.0,
+    m: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    Consolida????o de feedbacks para o endpoint /debug/metrics.
+    Retorna resumo global, por intent, ranking de documentos e eventos recentes.
+    """
+    events = list(_iter_events())
+    total_events = len(events)
+    success_total = sum(1 for ev in events if ev.success)
+    failure_total = total_events - success_total
+
+    last_event_ts: Optional[str] = None
+    intent_totals: Dict[str, Dict[str, int]] = {}
+    doc_totals: Dict[str, Dict[str, Any]] = {}
+    weighted_by_doc = _aggregate(events, intent=None, half_life_days=half_life_days)
+
+    for ev in events:
+        intent_key = ev.intent or "unknown"
+        intent_entry = intent_totals.setdefault(intent_key, {"total": 0, "success": 0, "failure": 0})
+        intent_entry["total"] += 1
+        if ev.success:
+            intent_entry["success"] += 1
+        else:
+            intent_entry["failure"] += 1
+
+        doc_key = ev.doc_path or ""
+        doc_entry = doc_totals.setdefault(
+            doc_key,
+            {"total": 0, "success": 0, "failure": 0, "last_ts": None, "intents": {}},
+        )
+        doc_entry["total"] += 1
+        if ev.success:
+            doc_entry["success"] += 1
+        else:
+            doc_entry["failure"] += 1
+        doc_entry["intents"][intent_key] = doc_entry["intents"].get(intent_key, 0) + 1
+        if ev.ts and (doc_entry["last_ts"] is None or ev.ts > doc_entry["last_ts"]):
+            doc_entry["last_ts"] = ev.ts
+        if ev.ts and (last_event_ts is None or ev.ts > last_event_ts):
+            last_event_ts = ev.ts
+
+    tw = sum(w for w, _ in weighted_by_doc.values())
+    tf = sum(f for _, f in weighted_by_doc.values())
+    weighted_total = tw + tf
+    weighted_stats = {
+        "weighted_successes": round(tw, 3),
+        "weighted_failures": round(tf, 3),
+        "weighted_total": round(weighted_total, 3),
+        "success_rate": round((tw / weighted_total) if weighted_total else 0.0, 4),
+        "events_count": total_events,
+        "half_life_days": half_life_days,
+        "m": m,
+    }
+
+    intent_summary: List[Dict[str, Any]] = []
+    for key, stats in sorted(intent_totals.items(), key=lambda kv: (kv[0] or "")):
+        intent_summary.append(
+            {
+                "intent": None if key == "unknown" else key,
+                "label": key if key != "unknown" else "unknown",
+                "total": stats["total"],
+                "success": stats["success"],
+                "failure": stats["failure"],
+                "success_rate": _success_rate(stats["success"], stats["total"]),
+            }
+        )
+
+    doc_rows: List[Dict[str, Any]] = []
+    for doc_key, stats in doc_totals.items():
+        wins_weighted, fails_weighted = weighted_by_doc.get(doc_key, (0.0, 0.0))
+        denom = wins_weighted + fails_weighted + max(1e-6, m)
+        prior = (wins_weighted - fails_weighted) / denom if denom else 0.0
+        prior = max(-1.0, min(1.0, float(prior)))
+        intents_breakdown = sorted(stats["intents"].items(), key=lambda kv: kv[1], reverse=True)
+        doc_rows.append(
+            {
+                "doc_path": doc_key or "(unknown)",
+                "total": stats["total"],
+                "success": stats["success"],
+                "failure": stats["failure"],
+                "success_rate": _success_rate(stats["success"], stats["total"]),
+                "last_feedback": stats["last_ts"],
+                "top_intent": intents_breakdown[0][0] if intents_breakdown else None,
+                "intents": [
+                    {
+                        "intent": name if name != "unknown" else None,
+                        "label": name if name != "unknown" else "unknown",
+                        "count": count,
+                    }
+                    for name, count in intents_breakdown
+                ],
+                "prior": round(prior, 4),
+            }
+        )
+
+    top_n = max(0, int(top_docs))
+    top_positive = (
+        sorted(doc_rows, key=lambda row: (row["success_rate"], row["total"]), reverse=True)[:top_n]
+        if doc_rows and top_n
+        else []
+    )
+    top_negative = (
+        sorted(doc_rows, key=lambda row: (row["success_rate"], -row["total"]))[:top_n]
+        if doc_rows and top_n
+        else []
+    )
+
+    recent_sorted = sorted(events, key=lambda ev: ev.ts or "", reverse=True)
+    recent_limit = max(0, int(max_recent))
+    recent_events = [
+        {
+            "ts": ev.ts,
+            "doc_path": ev.doc_path,
+            "success": ev.success,
+            "intent": ev.intent,
+            "ticket_id": ev.ticket_id,
+            "user_hash": ev.user_hash,
+        }
+        for ev in recent_sorted[:recent_limit]
+    ]
+
+    global_summary = {
+        "total_events": total_events,
+        "success": success_total,
+        "failure": failure_total,
+        "success_rate": _success_rate(success_total, total_events),
+        "last_event_ts": last_event_ts,
+        "unique_docs": len(doc_rows),
+        "weighted": weighted_stats,
+    }
+
+    return {
+        "global": global_summary,
+        "by_intent": intent_summary,
+        "documents": {
+            "total": len(doc_rows),
+            "top_positive": top_positive,
+            "top_negative": top_negative,
+        },
+        "recent_events": recent_events,
+    }
 
 # === Utilidades administrativas (opcionais) ===
 def export_events() -> List[dict]:

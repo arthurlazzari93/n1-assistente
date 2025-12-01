@@ -3,6 +3,12 @@
 .env.*
 *.log
 
+# Ambientes / caches Python
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+
 # Banco local
 *.sqlite*
 *.db
@@ -10,8 +16,18 @@
 *.db-wal
 n1agent.db
 
-# App
+# App (dados gerados em tempo de execuÇõÇœo)
 app.log
+app/kb_index.json
+app/data/
+
+# Frontend / Node
+frontend/node_modules/
+frontend/dist/
+n1-assistente-frontend@*
+npm-debug.log*
+*.tgz
+npm
 
 # IDE / SO
 .vscode/
