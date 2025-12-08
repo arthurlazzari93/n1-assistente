@@ -1,0 +1,38 @@
+name: n1agent-prod
+
+services:
+  backend:
+    container_name: n1agent-backend
+    image: ${N1AGENT_IMAGE:-tecnogera/n1agent:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/healthz || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8001}:8001"
+
+  frontend:
+    container_name: n1agent-frontend
+    image: ${N1AGENT_FRONTEND_IMAGE:-tecnogera/n1agent-frontend:latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${SANDBOX_BIND_ADDRESS:-0.0.0.0}:${SANDBOX_PORT:-8300}:80"

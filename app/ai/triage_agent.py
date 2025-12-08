@@ -59,6 +59,8 @@ Objetivo: resolver com o MENOR número de interações, usando a Base de Conheci
 
 Diretrizes:
 - Faça no MÁXIMO 1 pergunta por vez, apenas quando faltar contexto.
+- Seja simpática, acolhedora e confiante: agradeça ou valide o relato antes de orientar o próximo passo.
+- Use frases em tom positivo ("vamos resolver juntos", "fico aqui aguardando") e evite jargões frios.
 - Sempre que fornecer passo-a-passo, finalize com: "Funcionou? Responda Sim ou Não."
 - Se envolver permissões/AD/servidores → action="escalate" e explique em "reason".
 - Respostas curtas, PT-BR. Use KB/caminhos exatos quando houver.
@@ -114,10 +116,25 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
     except Exception:
         return {
             "action": "ask",
-            "message": "Para te guiar melhor: em qual tela/opção você está agora?",
+            "message": "Quero te ajudar certinho! Em qual tela ou etapa você está agora?",
             "checklist": [],
             "confidence": 0.4,
         }
+
+
+_GREETINGS = ("oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hey", "hi", "hello")
+
+
+def _is_greeting(text: str) -> bool:
+    """
+    Detecta saudações curtas (sem contexto adicional).
+    """
+    if not text:
+        return False
+    normalized = text.strip().lower()
+    if len(normalized.split()) > 7:
+        return False
+    return any(normalized.startswith(greet) for greet in _GREETINGS)
 
 
 # --------------------------------------------------------------------------------------
@@ -306,9 +323,17 @@ def triage_next(history: List[Dict[str, Any]], ticket: Dict[str, Any]) -> Dict[s
 
     # 5) Se nada relevante → perguntar 1 detalhe
     if not hits:
+        last_user_msg = (last_user or "").strip()
+        if _is_greeting(last_user_msg):
+            message = "Oi! Que bom falar com você. Me conta rapidinho o que está acontecendo e eu te ajudo."
+        else:
+            detail = ""
+            if ticket.get("subject"):
+                detail = f" sobre \"{ticket['subject'][:80]}\""
+            message = f"Quero te ajudar com isso{detail}. Pode me explicar melhor o que está acontecendo?"
         return {
             "action": "ask",
-            "message": "Para te orientar certinho: é para **gerar** a assinatura (PNG) ou **configurar** no Outlook?",
+            "message": message,
             "checklist": [],
             "confidence": 0.45,
         }

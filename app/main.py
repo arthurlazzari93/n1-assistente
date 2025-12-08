@@ -16,6 +16,21 @@ from pydantic import BaseModel
 from tenacity import RetryError
 from app.teams_graph import diag_bot_token
 from app.ai.triage_agent import triage_next
+from app.schemas import (
+    KBArticle,
+    KBArticleCreate,
+    KBArticleMetadata,
+    KBArticleUpdate,
+)
+from app.kb_admin import (
+    KBArticleAlreadyExistsError,
+    KBArticleNotFoundError,
+    create_kb_article,
+    force_reindex,
+    get_kb_article,
+    list_kb_articles,
+    update_kb_article,
+)
 
 # --- Windows: usar o event loop compatível (evita warnings/erros no BotBuilder)
 if sys.platform.startswith("win"):
@@ -51,6 +66,12 @@ from app.db import (
     set_user_current_ticket,
     INGEST_SOURCE_TEAMS_BOT,
     INGEST_ACTION_PROACTIVE_FOLLOWUP,
+    update_session_on_bot_message,
+    close_session,
+    get_sessions_for_reminder,
+    get_sessions_for_timeout,
+    SESSION_REMINDER_MINUTES,
+    SESSION_TIMEOUT_MINUTES,
 )
 
 from app.movidesk_client import (
@@ -124,6 +145,9 @@ MS_TENANT_ID = os.getenv("MS_TENANT_ID", "")
 BOT_APP_ID = os.getenv("MS_CLIENT_ID", "")
 BOT_APP_PASSWORD = os.getenv("MS_CLIENT_SECRET", "")
 ENABLE_TEAMS_BOT = os.getenv("ENABLE_TEAMS_BOT", "1").lower() in ("1", "true", "yes", "on")
+SESSION_REMINDER_MESSAGE = os.getenv("SESSION_REMINDER_MESSAGE", "").strip()
+ENABLE_SESSION_WATCHDOG = os.getenv("ENABLE_SESSION_WATCHDOG", "1").lower() in ("1", "true", "yes", "on")
+SESSION_WATCHDOG_POLL_SECONDS = int(os.getenv("SESSION_WATCHDOG_POLL_SECONDS", "60"))
 
 # DB
 init_db()
@@ -307,6 +331,7 @@ class ChatRequest(BaseModel):
 
     ticket: ChatTicket
     history: list[ChatMessage]
+    mode: str | None = "ticket"
 
 
 class ChatResponse(BaseModel):
@@ -367,6 +392,55 @@ def debug_metrics():
     return payload
 
 
+@app.get("/debug/kb/articles", response_model=list[KBArticleMetadata])
+def debug_kb_list_articles():
+    """
+    Lista artigos disponíveis na base de conhecimento.
+    Uso administrativo apenas (sandbox/debug).
+    """
+    return list_kb_articles()
+
+
+@app.get("/debug/kb/articles/{slug}", response_model=KBArticle)
+def debug_kb_get_article(slug: str):
+    try:
+        return get_kb_article(slug)
+    except KBArticleNotFoundError as exc:  # pragma: no cover - FastAPI converte em 404
+        raise HTTPException(status_code=404, detail=f"Artigo '{slug}' não encontrado") from exc
+
+
+@app.post("/debug/kb/articles", response_model=KBArticle, status_code=201)
+def debug_kb_create_article(body: KBArticleCreate):
+    try:
+        article = create_kb_article(body)
+    except KBArticleAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=f"Já existe artigo com slug '{body.slug}'") from exc
+    stats = force_reindex()
+    logger.info("[KB] artigo {} criado e índice atualizado: {}", body.slug, stats)
+    return article
+
+
+@app.put("/debug/kb/articles/{slug}", response_model=KBArticle)
+def debug_kb_update_article(slug: str, body: KBArticleUpdate):
+    try:
+        article = update_kb_article(slug, body)
+    except KBArticleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Artigo '{slug}' não encontrado") from exc
+    stats = force_reindex()
+    logger.info("[KB] artigo {} atualizado e índice reconstruído: {}", slug, stats)
+    return article
+
+
+@app.post("/debug/kb/reindex")
+def debug_kb_reindex():
+    """
+    Força a reindexação da base de conhecimento (BM25 + priors).
+    Rotas /debug/kb/* são administrativas e não devem ser expostas ao usuário final.
+    """
+    stats = force_reindex()
+    return {"status": "ok", "stats": stats, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
 @app.post("/debug/chat/triage", response_model=ChatResponse)
 def debug_chat_triage(body: ChatRequest):
     """
@@ -374,13 +448,27 @@ def debug_chat_triage(body: ChatRequest):
     Recebe hist��rico de mensagens + contexto (assunto/descri��ǜo)
     e retorna a pr��xima resposta sugerida pelo triage_agent.
     """
+    mode = (body.mode or "ticket").lower()
+    subject = body.ticket.subject or ""
+    description = body.ticket.description or ""
+    history = [{"role": m.role, "text": m.text} for m in body.history]
+
+    if mode == "chat":
+        if not subject:
+            subject = "[CHAT DIRETO] Sandbox Assistente N1"
+        if not description:
+            last_user_msg = next(
+                (m["text"] for m in reversed(history) if m.get("role") == "user" and m.get("text")),
+                "",
+            )
+            description = last_user_msg or "Conversa direta iniciada no sandbox (sem ticket Movidesk)."
+
     ticket = {
         "id": 0,
-        "subject": body.ticket.subject,
-        "first_action_text": body.ticket.description,
-        "description": body.ticket.description,
+        "subject": subject,
+        "first_action_text": description,
+        "description": description,
     }
-    history = [{"role": m.role, "text": m.text} for m in body.history]
 
     out = triage_next(history, ticket)
 
@@ -490,6 +578,101 @@ def run_followups_now():
     sent = _process_followups_once()
     return {"ok": True, "sent": sent}
 
+
+def _build_session_reminder_text() -> str:
+    if SESSION_REMINDER_MESSAGE:
+        return SESSION_REMINDER_MESSAGE
+    minutes_left = max(SESSION_TIMEOUT_MINUTES - SESSION_REMINDER_MINUTES, 1)
+    if minutes_left == 1:
+        window = "no pr?ximo minuto"
+    else:
+        window = f"nos pr?ximos {minutes_left} minutos"
+    return (
+        "Oi! Continuo com nossa conversa aberta. "
+        f"Se n?o receber retorno {window}, vou encerrar automaticamente. "
+        "Se ainda precisar de algo ? s? me mandar uma mensagem por aqui."
+    )
+
+
+
+def _send_chat_session_reminder(session: Dict[str, Any]) -> bool:
+    email = (session.get("user_email") or "").strip()
+    if not email:
+        logger.warning(f"[sessions] sess?o {session.get('id')} sem user_email para lembrete.")
+        return False
+    try:
+        notify_user_for_ticket(email, int(session.get("ticket_id") or 0), "Chat Assistente N1", preview_text=_build_session_reminder_text())
+        update_session_on_bot_message(int(session["id"]))
+        return True
+    except TeamsGraphError as exc:
+        logger.warning(f"[sessions] falha ao enviar lembrete da sess?o {session.get('id')}: {exc}")
+        return False
+
+
+
+_SESSION_TIMEOUT_HANDLER = None
+
+
+
+def _trigger_session_timeout(session: Dict[str, Any]) -> None:
+    global _SESSION_TIMEOUT_HANDLER
+    if _SESSION_TIMEOUT_HANDLER is None:
+        try:
+            from app.bot import handle_session_timeout  # type: ignore
+        except Exception as exc:
+            logger.warning(f"[sessions] n?o consegui carregar handle_session_timeout: {exc}")
+            _SESSION_TIMEOUT_HANDLER = False
+        else:
+            _SESSION_TIMEOUT_HANDLER = handle_session_timeout
+    if callable(_SESSION_TIMEOUT_HANDLER):
+        _SESSION_TIMEOUT_HANDLER(session)
+    else:
+        session_id = session.get("id")
+        if session_id:
+            try:
+                close_session(int(session_id), "encerrada_timeout")
+            except Exception as exc:
+                logger.warning(f"[sessions] falha ao encerrar sess?o {session_id} no fallback: {exc}")
+
+
+
+def _process_session_watchdog_once() -> Dict[str, int]:
+    stats = {"reminders": 0, "timeouts": 0}
+    try:
+        reminders = get_sessions_for_reminder()
+    except Exception as exc:
+        logger.warning(f"[sessions] get_sessions_for_reminder falhou: {exc}")
+        reminders = []
+    try:
+        timeouts = get_sessions_for_timeout()
+    except Exception as exc:
+        logger.warning(f"[sessions] get_sessions_for_timeout falhou: {exc}")
+        timeouts = []
+
+    timeout_ids = {s.get("id") for s in timeouts if s.get("type") == "chat_driven"}
+
+    for session in reminders:
+        if session.get("type") != "chat_driven":
+            continue
+        if session.get("id") in timeout_ids:
+            continue
+        if _send_chat_session_reminder(session):
+            stats["reminders"] += 1
+
+    for session in timeouts:
+        if session.get("type") != "chat_driven":
+            continue
+        _trigger_session_timeout(session)
+        stats["timeouts"] += 1
+    return stats
+
+
+
+@app.post("/cron/sessions/watchdog")
+def run_session_watchdog_now():
+    stats = _process_session_watchdog_once()
+    return {"ok": True, **stats}
+
 # Dispara o worker de lembretes quando a aplicação sobe (opcional)
 @app.on_event("startup")
 async def _boot_followups_loop():
@@ -510,6 +693,19 @@ async def _boot_followups_loop():
                     logger.exception(f"[FOLLOWUPS] erro no loop: {e}")
                 await asyncio.sleep(interval)
         asyncio.create_task(_loop())
+
+    if ENABLE_SESSION_WATCHDOG:
+        async def _session_loop():
+            interval = SESSION_WATCHDOG_POLL_SECONDS
+            logger.info(f"[SESSIONS] watchdog ativado (intervalo {interval}s)")
+            while True:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _process_session_watchdog_once)
+                except Exception as e:
+                    logger.exception(f"[SESSIONS] erro no watchdog: {e}")
+                await asyncio.sleep(interval)
+
+        asyncio.create_task(_session_loop())
 
 # -----------------------------------------------------------------------------#
 # BOT: carregamento seguro (sempre registra /api/messages)

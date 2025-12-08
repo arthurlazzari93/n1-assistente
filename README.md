@@ -51,6 +51,20 @@ Principais componentes:
    - `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`
    - Demais chaves conforme necessidade (veja `app/main.py` e `app/movidesk_client.py`).
 
+### Ajustando tempos de sessão e follow-ups
+
+Alguns tempos críticos são controlados por variáveis de ambiente para facilitar ajustes sem alterar código:
+
+- `SESSION_REMINDER_MINUTES` – minutos para um lembrete de sessão em andamento (default 15).
+- `SESSION_TIMEOUT_MINUTES` – minutos para encerrar uma sessão inativa automaticamente (default 60).
+- `FOLLOWUP_NUDGE1_MINUTES` – atraso do primeiro lembrete pró-ativo no Teams (default 10).
+- `FOLLOWUP_NUDGE2_MINUTES` – atraso do segundo lembrete (default 25).
+- `FOLLOWUP_FINAL_CLOSE_MINUTES` – atraso para a mensagem final/encerramento pró-ativo (default 85).
+- `ENABLE_SESSION_WATCHDOG` / `SESSION_WATCHDOG_POLL_SECONDS` – habilitam o monitoramento de sessões chat_driven e definem o intervalo (s) entre verificações (default 1 minuto / 60 s).
+- `SESSION_REMINDER_MESSAGE` – texto opcional do lembrete enviado antes do timeout (se vazio, usamos o padrão amigável do código).
+
+Edite esses valores no `.env` antes de subir a API. O arquivo `.env.sample` já traz todos os campos para referência.
+
 ## Executando a API localmente
 
 Após configurar o ambiente e o `.env`:
@@ -92,6 +106,15 @@ O fluxo típico é:
   - `docker-compose up --build`
 
 Consulte seu pipeline (ex.: `Jenkinsfile`) ou documentação interna para detalhes específicos de deploy.
+### Deploy de produ??o
+
+- `docker-compose.prod.yml` sobe backend (FastAPI/Bot) + frontend (sandbox React servido por Nginx) usando o mesmo `.env`.
+- O backend grava o SQLite em `./data/` (diret?rio ignorado pelo git) para facilitar reset/backup.
+- Ports padr?o:
+  - Backend: `127.0.0.1:8001` (mant?m compatibilidade com o agente antigo / t?nel).
+  - Frontend sandbox: `0.0.0.0:8300` (troque se preciso; porta 9443 continua livre).
+- Veja `DEPLOY.md` para o passo a passo completo (limpeza de DB, cuidados com containers antigos e comandos sugeridos para Ubuntu 24.04 + Jenkins).
+
 
 ## Frontend (React + Vite)
 

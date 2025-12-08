@@ -44,10 +44,26 @@ const SEEDS = [
   }
 ];
 
-const initialBanner = {
-  role: "system",
-  text: "Converse livremente com o agente para avaliar o fluxo de triagem, uso da KB e parâmetros da IA."
+const MODE_DESCRIPTIONS = {
+  ticket:
+    "Simule um chamado recebido no Movidesk e veja como o agente usa a triagem e a KB.",
+  chat: "Converse livremente com o agente, como se chamasse a TI no Teams sem ticket aberto."
 };
+
+const CHAT_MODE_DEFAULT_SUBJECT = "[CHAT DIRETO] Sandbox Assistente N1";
+const CHAT_MODE_DEFAULT_DESCRIPTION =
+  "Conversa direta iniciada no sandbox (sem ticket Movidesk).";
+const seedToMessage = (seed) =>
+  `${seed.subject}. ${seed.description}`;
+
+const TICKET_CONTEXT_ERROR =
+  "Defina pelo menos um assunto ou uma descrição inicial do chamado antes de conversar com o agente.";
+
+const createEmptyMetrics = () => ({
+  action: null,
+  intent: null,
+  confidence: null
+});
 
 function ChatPage({ onResetSession }) {
   const [history, setHistory] = useState([]);
@@ -55,11 +71,7 @@ function ChatPage({ onResetSession }) {
   const [subject, setSubject] = useState("");
   const [description, setDescription] = useState("");
   const [sessionStarted, setSessionStarted] = useState(false);
-  const [metrics, setMetrics] = useState({
-    action: null,
-    intent: null,
-    confidence: null
-  });
+  const [metrics, setMetrics] = useState(() => createEmptyMetrics());
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [lastRequest, setLastRequest] = useState(null);
@@ -70,8 +82,11 @@ function ChatPage({ onResetSession }) {
   const [metricsSummary, setMetricsSummary] = useState(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
   const [metricsError, setMetricsError] = useState("");
+  const [mode, setMode] = useState("ticket"); // ticket | chat
 
   const chatRef = useRef(null);
+  const isTicketMode = mode === "ticket";
+  const isChatMode = mode === "chat";
 
   useEffect(() => {
     if (chatRef.current) {
@@ -80,10 +95,27 @@ function ChatPage({ onResetSession }) {
   }, [history, loading]);
 
   const callAgent = async (historyPayload) => {
+    const subjTrimmed = subject.trim();
+    const descTrimmed = description.trim();
+    let effectiveSubject = subjTrimmed;
+    let effectiveDescription = descTrimmed;
+    if (mode === "chat") {
+      if (!effectiveSubject) {
+        effectiveSubject = CHAT_MODE_DEFAULT_SUBJECT;
+      }
+      if (!effectiveDescription) {
+        const lastUserMessage = [...historyPayload]
+          .reverse()
+          .find((msg) => msg.role === "user" && msg.text);
+        effectiveDescription =
+          lastUserMessage?.text?.trim() || CHAT_MODE_DEFAULT_DESCRIPTION;
+      }
+    }
     const payload = {
+      mode,
       ticket: {
-        subject: subject.trim(),
-        description: description.trim()
+        subject: effectiveSubject,
+        description: effectiveDescription
       },
       history: historyPayload
     };
@@ -106,25 +138,31 @@ function ChatPage({ onResetSession }) {
   const handleSend = async () => {
     if (loading) return;
     setError("");
-    if (!sessionStarted) {
-      setError('Clique em "Iniciar agente" para começar a conversa.');
-      return;
-    }
-
     const trimmed = message.trim();
     if (!trimmed) return;
 
-    const subj = subject.trim();
-    const desc = description.trim();
-
-    if (!subj && !desc) {
-      setError(
-        "Defina pelo menos um assunto ou uma descrição inicial do chamado antes de conversar com o agente."
-      );
-      return;
+    let historyBase = history;
+    if (!sessionStarted) {
+      if (mode === "chat") {
+        historyBase = [];
+        setMetrics(createEmptyMetrics());
+        setSessionStarted(true);
+      } else {
+        setError(TICKET_CONTEXT_ERROR);
+        return;
+      }
     }
 
-    const nextHistory = [...history, { role: "user", text: trimmed }];
+    if (mode === "ticket") {
+      const subj = subject.trim();
+      const desc = description.trim();
+      if (!subj && !desc) {
+        setError(TICKET_CONTEXT_ERROR);
+        return;
+      }
+    }
+
+    const nextHistory = [...historyBase, { role: "user", text: trimmed }];
     setHistory(nextHistory);
     setMessage("");
     setLoading(true);
@@ -151,15 +189,23 @@ function ChatPage({ onResetSession }) {
   };
 
   const handleStartAgent = async () => {
-    if (loading || sessionStarted) return;
+    if (loading) return;
     setError("");
+
+    if (mode === "chat") {
+      if (!sessionStarted) {
+        setMetrics(createEmptyMetrics());
+        setSessionStarted(true);
+      }
+      return;
+    }
+
+    if (sessionStarted) return;
 
     const subj = subject.trim();
     const desc = description.trim();
     if (!subj && !desc) {
-      setError(
-        "Defina pelo menos um assunto ou uma descrição inicial do chamado antes de iniciar o agente."
-      );
+      setError(TICKET_CONTEXT_ERROR);
       return;
     }
 
@@ -185,9 +231,9 @@ function ChatPage({ onResetSession }) {
     }
   };
 
-  const handleReset = () => {
+  const resetSessionState = () => {
     setHistory([]);
-    setMetrics({ action: null, intent: null, confidence: null });
+    setMetrics(createEmptyMetrics());
     setError("");
     setMessage("");
     setSessionStarted(false);
@@ -195,6 +241,10 @@ function ChatPage({ onResetSession }) {
     setLastResponse(null);
     setSelectedSeed(null);
     setMetricsSummary(null);
+  };
+
+  const handleReset = () => {
+    resetSessionState();
     if (typeof onResetSession === "function") {
       onResetSession();
     }
@@ -208,12 +258,26 @@ function ChatPage({ onResetSession }) {
   };
 
   const handleSeedSelect = (seed) => {
-    setSubject(seed.subject);
-    setDescription(seed.description);
+    if (mode === "chat") {
+      setMessage(seedToMessage(seed));
+    } else {
+      setSubject(seed.subject);
+      setDescription(seed.description);
+    }
     setSelectedSeed(seed.id);
     setSessionStarted(false);
     setHistory([]);
-    setMetrics({ action: null, intent: null, confidence: null });
+    setMetrics(createEmptyMetrics());
+  };
+
+  const handleModeChange = (nextMode) => {
+    if (nextMode === mode) return;
+    resetSessionState();
+    setSubject("");
+    setDescription("");
+    setMessage("");
+    setError("");
+    setMode(nextMode);
   };
 
   const handleCopyJson = (type) => {
@@ -286,6 +350,34 @@ function ChatPage({ onResetSession }) {
     return items;
   };
 
+  const disableContext = isChatMode;
+  const messageControlsDisabled = loading || (isTicketMode && !sessionStarted);
+  const inputPlaceholder = isChatMode
+    ? "Digite sua dúvida e eu respondo por aqui..."
+    : sessionStarted
+    ? "Descreva o próximo passo ou responda ao agente..."
+    : 'Clique em "Iniciar agente" para começar';
+  const sessionStatus = sessionStarted
+    ? {
+        label: isTicketMode ? "Ticket em atendimento" : "Chat em andamento",
+        tone: "active",
+        hint: isTicketMode
+          ? "Responda ao assistente para concluir a triagem."
+          : "Você pode mandar novas mensagens quando quiser."
+      }
+    : isTicketMode
+    ? {
+        label: "Aguardando contexto do chamado",
+        tone: "idle",
+        hint: 'Informe assunto ou descrição e clique em "Iniciar agente".'
+      }
+    : {
+        label: "Pronto para chat direto",
+        tone: "ready",
+        hint: "Digite sua dúvida e aperte Enter para iniciar."
+      };
+  const bottomHint = sessionStatus.hint;
+
   return (
     <div className={`app-shell ${showLogs ? "with-logs" : ""}`}>
       <header className="app-header">
@@ -316,12 +408,37 @@ function ChatPage({ onResetSession }) {
               ))}
             </div>
           </div>
-          <div ref={chatRef} className="chat-body">
-            <div className="system-banner">
+          <div className="session-toolbar">
+            <div className="session-info">
               <span className="system-pill">Sessão de teste</span>
-              {initialBanner.text}
+              <p>{MODE_DESCRIPTIONS[mode]}</p>
             </div>
-
+            <div className="session-toolbar-actions">
+              <div className={`session-status session-status--${sessionStatus.tone}`}>
+                <span className="session-status__dot" />
+                {sessionStatus.label}
+              </div>
+              <div
+                className="mode-toggle"
+                role="group"
+                aria-label="Selecionar modo de simulação"
+              >
+                <button
+                  className={`mode-toggle__btn ${isTicketMode ? "active" : ""}`}
+                  onClick={() => handleModeChange("ticket")}
+                >
+                  Chamado Movidesk
+                </button>
+                <button
+                  className={`mode-toggle__btn ${isChatMode ? "active" : ""}`}
+                  onClick={() => handleModeChange("chat")}
+                >
+                  Chat direto com a TI
+                </button>
+              </div>
+            </div>
+          </div>
+          <div ref={chatRef} className="chat-body">
             {history.map((msg, idx) => {
               if (msg.role === "system") return null;
               const role = msg.role === "assistant" ? "agent" : "user";
@@ -350,22 +467,18 @@ function ChatPage({ onResetSession }) {
               <div className="input-box">
                 <input
                   type="text"
-                  disabled={!sessionStarted || loading}
+                  disabled={messageControlsDisabled}
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={
-                    sessionStarted
-                      ? "Descreva o próximo passo ou responda ao agente..."
-                      : 'Clique em "Iniciar agente" para começar'
-                  }
+                  placeholder={inputPlaceholder}
                   autoComplete="off"
                 />
               </div>
               <button
                 className="btn-primary"
                 onClick={handleSend}
-                disabled={loading || !sessionStarted}
+                disabled={messageControlsDisabled}
               >
                 Enviar
               </button>
@@ -374,7 +487,7 @@ function ChatPage({ onResetSession }) {
               <button
                 className="btn-accent"
                 onClick={handleStartAgent}
-                disabled={loading || sessionStarted}
+                disabled={loading || (isTicketMode && sessionStarted)}
               >
                 Iniciar agente
               </button>
@@ -382,7 +495,7 @@ function ChatPage({ onResetSession }) {
                 Resetar conversa
               </button>
               <div className="input-placeholder hide-mobile">
-                Dica: simule um chamado real e acompanhe como o agente usa a KB.
+                {bottomHint}
               </div>
             </div>
           </div>
@@ -393,7 +506,9 @@ function ChatPage({ onResetSession }) {
             <div>
               <strong>Contexto do chamado</strong>
               <div className="ctx-subtitle">
-                Assunto e descrição inicial usados como ticket pelo agente.
+                {mode === "chat"
+                  ? "Modo chat direto: campos desativados. A conversa começa pela mensagem abaixo."
+                  : "Assunto e descrição inicial usados como ticket pelo agente."}
               </div>
             </div>
           </div>
@@ -403,6 +518,7 @@ function ChatPage({ onResetSession }) {
             <input
               id="subject-input"
               type="text"
+              disabled={disableContext}
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
               placeholder="Ex: Erro ao configurar assinatura no Outlook"
@@ -413,6 +529,7 @@ function ChatPage({ onResetSession }) {
             <label htmlFor="description-input">Descrição inicial do problema</label>
             <textarea
               id="description-input"
+              disabled={disableContext}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Ex: Usuário relata que a assinatura não aparece ao criar novos e-mails..."
@@ -421,7 +538,9 @@ function ChatPage({ onResetSession }) {
 
           <div className="ctx-footer">
             <span>
-              Estes campos simulam o texto do ticket no Movidesk.
+              {mode === "chat"
+                ? "No modo chat direto não usamos assunto/descrição — basta iniciar a conversa."
+                : "Estes campos simulam o texto do ticket no Movidesk."}
             </span>
           </div>
           <div className="metrics-panel">
@@ -459,7 +578,10 @@ function ChatPage({ onResetSession }) {
             <div className="metrics">{renderMetrics()}</div>
           </div>
 
-          {error && <div className="error-banner">{error}</div>}
+          {error &&
+            (isTicketMode || error !== TICKET_CONTEXT_ERROR) && (
+              <div className="error-banner">{error}</div>
+            )}
         </aside>
         {showLogs && (
           <aside className="logs-panel">

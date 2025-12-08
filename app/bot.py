@@ -25,7 +25,19 @@ from .db import (
     get_user_context_by_teams_id,
     list_tickets_for_requester,
     get_ticket_rec,
+    create_session,
+    get_active_session_for_user,
+    update_session_on_bot_message,
+    update_session_on_user_message,
+    close_session,
+    get_session_by_id,
+    set_session_movidesk_ticket,
 )
+from .session_movidesk import (
+    build_chat_session_summary,
+    create_resolved_movidesk_ticket_from_session,
+)
+from .teams_graph import TeamsGraphError, notify_user_for_ticket
 
 # Nota de arquitetura:
 #   Historicamente o bot assumia um único ticket por conversa. Esta implementação mantém compatibilidade,
@@ -201,6 +213,221 @@ class N1Bot(ActivityHandler):
             norm_hist.append({"role": (m.get("role") or "user"), "text": (txt or "")})
         conv["hist"] = norm_hist
 
+    def _session_touch_bot(self, conv: Dict[str, Any]) -> None:
+        session_id = conv.get("session_id")
+        if not session_id:
+            return
+        try:
+            update_session_on_bot_message(int(session_id))
+        except Exception as e:
+            logger.warning(f"[BOT] falha ao atualizar last_bot_message_at da sessÇõÇœ {session_id}: {e}")
+
+    def _session_touch_user(self, conv: Dict[str, Any]) -> None:
+        session_id = conv.get("session_id")
+        if not session_id:
+            return
+        try:
+            update_session_on_user_message(int(session_id))
+        except Exception as e:
+            logger.warning(f"[BOT] falha ao atualizar last_user_message_at da sessÇõÇœ {session_id}: {e}")
+
+    def _record_session_close(self, conv: Dict[str, Any], status: str) -> None:
+        session_id = conv.get("session_id")
+        if not session_id:
+            return
+        try:
+            close_session(int(session_id), status)
+        except Exception as e:
+            logger.warning(f"[BOT] falha ao encerrar sessÇõÇœ {session_id} ({status}): {e}")
+        finally:
+            conv["session_id"] = None
+            conv["session_type"] = None
+            conv["chat_intro_sent"] = False
+
+    def _ensure_ticket_session(
+        self,
+        conv: Dict[str, Any],
+        ticket_id: int,
+        movidesk_ticket_id: Optional[str],
+        initial_status: str = "aguardando_resposta_usuario",
+    ) -> int:
+        existing: Optional[Dict[str, Any]] = None
+        teams_user_id = conv.get("teams_user_id")
+        if teams_user_id:
+            try:
+                existing = get_active_session_for_user(teams_user_id)
+            except Exception:
+                existing = None
+        if existing and existing.get("ticket_id") == ticket_id:
+            conv["session_id"] = existing["id"]
+            conv["session_type"] = "ticket_driven"
+            return int(existing["id"])
+        session_id = create_session(
+            teams_user_id=teams_user_id,
+            user_email=conv.get("user_email"),
+            ticket_id=ticket_id,
+            movidesk_ticket_id=movidesk_ticket_id,
+            session_type="ticket_driven",
+            initial_status=initial_status,
+        )
+        conv["session_id"] = session_id
+        conv["session_type"] = "ticket_driven"
+        conv["chat_intro_sent"] = False
+        return session_id
+
+    def _ensure_chat_session(self, conv: Dict[str, Any]) -> int:
+        if conv.get("session_id") and conv.get("session_type") == "chat_driven":
+            return int(conv["session_id"])
+        teams_user_id = conv.get("teams_user_id")
+        existing: Optional[Dict[str, Any]] = None
+        if teams_user_id:
+            try:
+                existing = get_active_session_for_user(teams_user_id)
+            except Exception:
+                existing = None
+        if existing and existing.get("ticket_id") is None:
+            conv["session_id"] = existing["id"]
+            conv["session_type"] = "chat_driven"
+            return int(existing["id"])
+        session_id = create_session(
+            teams_user_id=teams_user_id,
+            user_email=conv.get("user_email"),
+            ticket_id=None,
+            movidesk_ticket_id=None,
+            session_type="chat_driven",
+            initial_status="em_andamento",
+        )
+        conv["session_id"] = session_id
+        conv["session_type"] = "chat_driven"
+        conv["chat_intro_sent"] = False
+        return session_id
+
+    def _hydrate_session_from_store(self, conv: Dict[str, Any]) -> None:
+        if conv.get("session_id") or not conv.get("teams_user_id"):
+            return
+        try:
+            session = get_active_session_for_user(conv["teams_user_id"])
+        except Exception:
+            session = None
+        if not session:
+            return
+        conv["session_id"] = session["id"]
+        conv["session_type"] = "ticket_driven" if session.get("ticket_id") else "chat_driven"
+        if session.get("ticket_id") and not conv.get("ticket"):
+            conv["ticket"] = session["ticket_id"]
+            self._hydrate_ticket_from_db(conv, session["ticket_id"])
+
+    def _conversation_to_text(self, conv: Dict[str, Any], max_msgs: int = 10) -> str:
+        lines: List[str] = []
+        for msg in conv.get("hist", [])[-max_msgs:]:
+            role = (msg.get("role") or "").lower()
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            prefix = "Usuário" if role == "user" else "Bot"
+            lines.append(f"{prefix}: {text}")
+        return "\n".join(lines)
+
+    async def _send_reply(self, turn_context: TurnContext, conv: Dict[str, Any], message: str) -> None:
+        await turn_context.send_activity(message)
+        self._session_touch_bot(conv)
+
+    async def _finish_chat_session(self, turn_context: TurnContext, conv: Dict[str, Any], resolved: bool) -> None:
+        session_row = None
+        if conv.get("session_id"):
+            try:
+                session_row = get_session_by_id(int(conv["session_id"]))
+            except Exception:
+                session_row = None
+        if resolved:
+            msg = "Ótimo! Fico por aqui. Sempre que precisar de algo de TI, é só me chamar novamente."
+            status = "encerrada_resolvido"
+        else:
+            msg = (
+                "Certo, vou encaminhar para um analista humano e você será avisado quando houver novidades. "
+                "Se quiser complementar algo, é só mandar outra mensagem."
+            )
+            status = "encerrada_escalado"
+        await self._send_reply(turn_context, conv, msg)
+        if (
+            resolved
+            and (conv.get("session_type") == "chat_driven")
+            and conv.get("session_id")
+        ):
+            session_payload = dict(session_row or {})
+            session_payload.setdefault("id", conv.get("session_id"))
+            session_payload.setdefault("user_email", conv.get("user_email"))
+            session_payload.setdefault("subject", conv.get("subject"))
+            session_payload.setdefault("type", "chat_driven")
+            already_synced = (session_payload.get("movidesk_ticket_id") or "").strip()
+            if not already_synced:
+                try:
+                    conversation_text = self._conversation_to_text(conv)
+                    summary = build_chat_session_summary(session_payload, conversation_text)
+                    created_ticket_id = create_resolved_movidesk_ticket_from_session(session_payload, summary)
+                    if created_ticket_id:
+                        set_session_movidesk_ticket(int(conv["session_id"]), str(created_ticket_id))
+                except Exception as e:
+                    logger.warning(f"[BOT] falha ao criar ticket Movidesk da sessão chat_driven {conv.get('session_id')}: {e}")
+        self._record_session_close(conv, status)
+        self._reset_conversation(conv)
+
+    async def _handle_chat_driven(self, turn_context: TurnContext, conv: Dict[str, Any], user_text: str) -> None:
+        self._ensure_chat_session(conv)
+        conv["flow"] = "chat"
+        conv["hist"].append({"role": "user", "text": user_text})
+        self._session_touch_user(conv)
+        if not conv.get("ctx"):
+            conv["ctx"] = user_text
+        if not conv.get("subject"):
+            conv["subject"] = user_text[:120]
+        if not conv.get("chat_intro_sent"):
+            intro = (
+                "Oi! Sou o assistente virtual da TI. Posso orientar dúvidas rápidas mesmo sem chamado aberto. "
+                "Me conte o que está acontecendo e eu tento te guiar."
+            )
+            conv["hist"].append({"role": "assistant", "text": intro})
+            conv["agent_msgs"] += 1
+            await self._send_reply(turn_context, conv, intro)
+            conv["chat_intro_sent"] = True
+        ticket_ctx = {
+            "id": 0,
+            "subject": conv.get("subject") or "Atendimento virtual",
+            "first_action_text": conv.get("ctx") or user_text,
+        }
+        reply, out = await self._triage_with_hint(conv, ticket_ctx, extra_hint=None)
+        action = (out.get("action") or "").lower()
+        confidence = float(out.get("confidence") or 0) if isinstance(out.get("confidence"), (int, float, str)) else 0.0
+        if action == "escalate":
+            reply = (
+                (out.get("message") or "Este atendimento precisa de um analista humano.").strip()
+                + "\n\n"
+                "Vou encaminhar para a equipe de TI e avisar quando houver retorno."
+            )
+            conv["awaiting_ok"] = False
+            conv["hist"].append({"role": "assistant", "text": reply})
+            conv["agent_msgs"] += 1
+            await self._send_reply(turn_context, conv, reply)
+            await self._finish_chat_session(turn_context, conv, resolved=False)
+            return
+
+        kb_reply = None
+        if action in ("answer", "resolve") and confidence >= 0.45:
+            kb_reply = self._maybe_use_kb(ticket_ctx, conv, out.get("intent"))
+
+        has_steps = bool(out.get("checklist")) or action in ("answer", "resolve")
+        if kb_reply:
+            reply = f"{reply}\n\n{kb_reply}\n\n**Funcionou?** Responda *Sim* ou *Não*."
+            conv["awaiting_ok"] = True
+        elif has_steps:
+            reply = reply.rstrip() + "\n\n**Funcionou?** Responda *Sim* ou *Não*."
+            conv["awaiting_ok"] = True
+        else:
+            conv["awaiting_ok"] = False
+
+        conv["hist"].append({"role": "assistant", "text": reply})
+        conv["agent_msgs"] += 1
+        await self._send_reply(turn_context, conv, reply)
     async def _publish_summary_and_optionally_close(self, turn_context: TurnContext, conv: dict, close: bool):
         from app.summarizer import summarize_conversation  # gera resumo curto
         from app.movidesk_client import add_public_note, close_ticket  # ação pública e fechamento
@@ -218,17 +445,17 @@ class N1Bot(ActivityHandler):
         if close:
             try:
                 close_ticket(ticket_id)
-                await turn_context.send_activity(
+                await self._send_reply(turn_context, conv, 
                     "✅ Perfeito! Registrei o resumo no chamado e **encerrei como resolvido**. "
                     "Se precisar, é só reabrir por aqui."
                 )
             except Exception:
-                await turn_context.send_activity(
+                await self._send_reply(turn_context, conv, 
                     "✅ Registrei o resumo no chamado. **Tentei encerrar** como resolvido; "
                     "se algo falhar o analista verifica."
                 )
         else:
-            await turn_context.send_activity(
+            await self._send_reply(turn_context, conv, 
                 "👍 Registrei o resumo no chamado. Um analista **seguirá com o atendimento**."
             )
 
@@ -248,6 +475,9 @@ class N1Bot(ActivityHandler):
         conv["hist"] = []
         conv["agent_msgs"] = 0
         conv["ticket_list_cache"] = []
+        conv["session_id"] = None
+        conv["session_type"] = None
+        conv["chat_intro_sent"] = False
 
     def _extract_user_identity(self, turn_context: TurnContext) -> tuple[Optional[str], Optional[str]]:
         user = getattr(turn_context.activity, "from_property", None)
@@ -319,13 +549,16 @@ class N1Bot(ActivityHandler):
                 "best_intent": None,
             }
         )
+        self._ensure_ticket_session(conv, ticket_id, str(ticket_id), initial_status="aguardando_resposta_usuario")
         if user_email:
             set_user_current_ticket(user_email, ticket_id, teams_user_id=teams_user_id)
         if not send_opening:
             subject = conv.get("subject") or f"Ticket #{ticket_id}"
             conv["hist"].append({"role": "assistant", "text": f"Ok! Continuamos no ticket #{ticket_id}: **{subject}**."})
-            await turn_context.send_activity(
-                f"Ok! Continuamos no ticket #{ticket_id}: **{subject}**.\nMe conte o que está acontecendo para eu ajudar."
+            await self._send_reply(
+                turn_context,
+                conv,
+                f"Ok! Continuamos no ticket #{ticket_id}: **{subject}**.\nMe conte o que está acontecendo para eu ajudar.",
             )
             await self._save(turn_context, conv)
             return
@@ -343,7 +576,7 @@ class N1Bot(ActivityHandler):
             logger.warning("[BOT] não foi possível gerar saudação via IA (usa fallback).")
         conv["hist"].append({"role": "assistant", "text": opening})
         conv["agent_msgs"] += 1
-        await turn_context.send_activity(opening)
+        await self._send_reply(turn_context, conv, opening)
 
         ticket_ctx = {
             "id": ticket_id,
@@ -363,7 +596,7 @@ class N1Bot(ActivityHandler):
             conv["awaiting_ok"] = False
             conv["hist"].append({"role": "assistant", "text": reply})
             conv["agent_msgs"] += 1
-            await turn_context.send_activity(reply)
+            await self._send_reply(turn_context, conv, reply)
             try:
                 if conv.get("best_doc_path"):
                     record_feedback(
@@ -375,6 +608,7 @@ class N1Bot(ActivityHandler):
             except Exception as e:
                 logger.warning(f"[BOT] falha ao registrar feedback (escalate): {e}")
             await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
+            self._record_session_close(conv, "encerrada_escalado")
             self._reset_conversation(conv)
             await self._save(turn_context, conv)
             return
@@ -393,21 +627,21 @@ class N1Bot(ActivityHandler):
 
         conv["hist"].append({"role": "assistant", "text": reply})
         conv["agent_msgs"] += 1
-        await turn_context.send_activity(reply)
+        await self._send_reply(turn_context, conv, reply)
         await self._save(turn_context, conv)
 
     async def _send_status(self, turn_context: TurnContext, conv: Dict[str, Any]) -> None:
         ticket_id = conv.get("ticket")
         if not ticket_id:
-            await turn_context.send_activity(
+            await self._send_reply(turn_context, conv, 
                 "Você não selecionou nenhum ticket. Envie `listar` para ver os chamados em andamento e depois `continuar 1` para escolher um."
             )
             return
         rec = get_ticket_rec(ticket_id)
         if not rec:
-            await turn_context.send_activity("Não encontrei dados locais deste ticket. Tente `iniciar <id>` novamente.")
+            await self._send_reply(turn_context, conv, "Não encontrei dados locais deste ticket. Tente `iniciar <id>` novamente.")
             return
-        await turn_context.send_activity(build_status_message(rec))
+        await self._send_reply(turn_context, conv, build_status_message(rec))
 
     # ---------------- eventos ----------------
     async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
@@ -432,23 +666,27 @@ class N1Bot(ActivityHandler):
         conv.setdefault("best_doc_path", None)
         conv.setdefault("best_intent", None)
         conv.setdefault("ticket_list_cache", [])
+        conv.setdefault("session_id", None)
+        conv.setdefault("session_type", None)
+        conv.setdefault("chat_intro_sent", False)
         if user_email:
             conv["user_email"] = user_email.lower()
         if teams_user_id:
             conv["teams_user_id"] = teams_user_id
         self._normalize_hist(conv)
         self._sync_user_context(conv)
+        self._hydrate_session_from_store(conv)
 
         # -------- comandos ----------
         if text in ("listar", "listar tickets"):
             if not conv.get("user_email"):
-                await turn_context.send_activity(
+                await self._send_reply(turn_context, conv, 
                     "Não consegui identificar seu e-mail para listar os tickets. Tente novamente em instantes."
                 )
             else:
                 tickets = list_tickets_for_requester(conv["user_email"], limit=5)
                 conv["ticket_list_cache"] = tickets
-                await turn_context.send_activity(format_ticket_listing(tickets))
+                await self._send_reply(turn_context, conv, format_ticket_listing(tickets))
             await self._save(turn_context, conv)
             return
 
@@ -469,7 +707,7 @@ class N1Bot(ActivityHandler):
                     send_opening=False,
                 )
             else:
-                await turn_context.send_activity("Não consegui identificar esse ticket. Use `listar` e depois `continuar 1`.")
+                await self._send_reply(turn_context, conv, "Não consegui identificar esse ticket. Use `listar` e depois `continuar 1`.")
             return
 
         if text == "status":
@@ -495,9 +733,17 @@ class N1Bot(ActivityHandler):
 
         # “Sim”/“Não” sem ticket ativo → pedir número do chamado
         if conv.get("ticket") is None and (self._user_says_yes(text_raw) or self._user_says_no(text_raw)):
-            await turn_context.send_activity(
-                "Você não está com nenhum ticket selecionado. Envie `listar` para ver os chamados e `continuar 1` para escolher um antes de responder `Sim` ou `Não`."
-            )
+            if conv.get("session_type") == "chat_driven" and conv.get("session_id"):
+                conv["hist"].append({"role": "user", "text": text_raw})
+                self._session_touch_user(conv)
+                resolved = self._user_says_yes(text_raw)
+                await self._finish_chat_session(turn_context, conv, resolved=resolved)
+            else:
+                await self._send_reply(
+                    turn_context,
+                    conv,
+                    "Você não está com nenhum ticket selecionado. Envie `listar` para ver os chamados e `continuar 1` para escolher um antes de responder `Sim` ou `Não`.",
+                )
             await self._save(turn_context, conv)
             return
 
@@ -523,9 +769,11 @@ class N1Bot(ActivityHandler):
 
                     conv["awaiting_ok"] = False
                     conv["hist"].append({"role": "user", "text": text_raw})
+                    self._session_touch_user(conv)
                     await self._publish_summary_and_optionally_close(turn_context, conv, close=True)
                     if user_email_ctx:
                         set_user_current_ticket(user_email_ctx, None, teams_user_id=teams_id_ctx)
+                    self._record_session_close(conv, "encerrada_resolvido")
                     self._reset_conversation(conv)
                     await self._save(turn_context, conv)
                     return
@@ -545,9 +793,11 @@ class N1Bot(ActivityHandler):
 
                     conv["awaiting_ok"] = False
                     conv["hist"].append({"role": "user", "text": text_raw})
+                    self._session_touch_user(conv)
                     await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
                     if user_email_ctx:
                         set_user_current_ticket(user_email_ctx, None, teams_user_id=teams_id_ctx)
+                    self._record_session_close(conv, "encerrada_escalado")
                     self._reset_conversation(conv)
                     await self._save(turn_context, conv)
                     return
@@ -561,6 +811,7 @@ class N1Bot(ActivityHandler):
 
             # registra fala do usuário
             conv["hist"].append({"role": "user", "text": text_raw})
+            self._session_touch_user(conv)
 
             # se travou, dá uma dica para o agente tentar rota alternativa
             hint = None
@@ -586,7 +837,7 @@ class N1Bot(ActivityHandler):
                 conv["awaiting_ok"] = False
                 conv["hist"].append({"role": "assistant", "text": reply})
                 conv["agent_msgs"] += 1
-                await turn_context.send_activity(reply)
+                await self._send_reply(turn_context, conv, reply)
                 try:
                     if conv.get("best_doc_path"):
                         record_feedback(
@@ -600,6 +851,7 @@ class N1Bot(ActivityHandler):
                 await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
                 if user_email_ctx:
                     set_user_current_ticket(user_email_ctx, None, teams_user_id=teams_id_ctx)
+                self._record_session_close(conv, "encerrada_escalado")
                 self._reset_conversation(conv)
                 await self._save(turn_context, conv)
                 return
@@ -618,12 +870,13 @@ class N1Bot(ActivityHandler):
 
             # limite de 25 mensagens do agente
             if conv["agent_msgs"] >= 25:
-                await turn_context.send_activity(
+                await self._send_reply(turn_context, conv, 
                     "Chegamos ao limite de tentativas automáticas. Vou encaminhar para um técnico e registrar o resumo no chamado."
                 )
                 await self._publish_summary_and_optionally_close(turn_context, conv, close=False)
                 if user_email_ctx:
                     set_user_current_ticket(user_email_ctx, None, teams_user_id=teams_id_ctx)
+                self._record_session_close(conv, "encerrada_escalado")
                 self._reset_conversation(conv)
                 await self._save(turn_context, conv)
                 return
@@ -643,13 +896,45 @@ class N1Bot(ActivityHandler):
 
             conv["hist"].append({"role": "assistant", "text": reply})
             conv["agent_msgs"] += 1
-            await turn_context.send_activity(reply)
+            await self._send_reply(turn_context, conv, reply)
             await self._save(turn_context, conv)
             return
 
-        # sem ticket ainda
-        await turn_context.send_activity("Para começar, me diga o número do chamado (ex.: `iniciar 12345` ou só o número).")
+        # sem ticket ainda -> trata como sessão chat_driven
+        await self._handle_chat_driven(turn_context, conv, text_raw)
         await self._save(turn_context, conv)
+
+
+
+
+def handle_session_timeout(session: Dict[str, Any]) -> None:
+    """
+    Envia a mensagem final ao usuário e encerra a sessão por timeout.
+    """
+    session_id = session.get("id")
+    user_email = (session.get("user_email") or "").strip()
+    ticket_id = session.get("ticket_id") or 0
+    subject = session.get("movidesk_ticket_id") or "Chat com o Assistente N1"
+    text = (
+        "Não recebi mais mensagens por aqui, então vou encerrar esta sessão automática. "
+        "Quando quiser retomar a conversa é só me chamar novamente por este chat."
+    )
+
+    if user_email:
+        try:
+            notify_user_for_ticket(user_email, int(ticket_id or 0), str(subject), preview_text=text)
+            if session_id:
+                update_session_on_bot_message(int(session_id))
+        except TeamsGraphError as exc:
+            logger.warning(f"[BOT] falha ao enviar aviso de timeout da sessão {session_id}: {exc}")
+    else:
+        logger.warning(f"[BOT] sessão {session_id} sem user_email para notificar sobre timeout.")
+
+    if session_id:
+        try:
+            close_session(int(session_id), "encerrada_timeout")
+        except Exception as exc:
+            logger.warning(f"[BOT] falha ao encerrar sessão {session_id} por timeout: {exc}")
 
 
 # Resumo: este bot agora suporta múltiplos tickets por usuário (`listar`, `continuar <n>`, `status`)

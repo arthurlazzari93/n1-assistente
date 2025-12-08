@@ -187,6 +187,13 @@ def reindex() -> Dict[str, Any]:
     _build_index()
     return {"docs": len(_DOCS), "chunks": len(_CHUNKS), "avgdl": _AVGDL}
 
+
+def rebuild_kb_index() -> Dict[str, Any]:
+    """
+    Alias público para reconstruir o índice da KB a partir dos arquivos markdown.
+    """
+    return reindex()
+
 # --------------------------------------------------------------------------------------
 # Busca (BM25 + priors opcionais)
 # --------------------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+# Files that contain secrets and must never be uploaded or templatized
+.env
+.env.local
+.env.dev
+.env.staging
+.env.prod
+.env.production
+.env.*.local
+deploy/.env*
