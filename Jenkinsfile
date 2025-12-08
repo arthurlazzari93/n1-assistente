@@ -27,15 +27,17 @@ pipeline {
     }
 
     stage('Frontend Build') {
+      agent {
+        docker {
+          image 'node:20-bullseye'
+          args '-u root:root'
+        }
+      }
       steps {
         dir('frontend') {
           sh '''
             set -euxo pipefail
-            if [ -f package-lock.json ]; then
-              npm ci
-            else
-              npm install
-            fi
+            npm ci
             npm run build
           '''
         }
