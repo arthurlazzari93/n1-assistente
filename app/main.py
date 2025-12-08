@@ -938,13 +938,22 @@ async def ingest_movidesk(
 
     is_email = _is_email_channel(ticket)
     matches_account = _email_to_matches(ticket)
-    allowed = bool(is_email and matches_account)
+    blocked_reason = None
+    if is_email:
+        allowed = bool(matches_account)
+        if not allowed:
+            blocked_reason = "channel-not-allowed"
+    else:
+        allowed = bool(requester_email)
+        if not allowed:
+            blocked_reason = "missing-requester-email"
+
     if not allowed:
         _log_ingest(
             INGEST_ACTION_SKIP_FLOW,
             "success",
             ticket_id=ticket_id,
-            context={"reason": "channel-not-allowed", "origin": origin_code},
+            context={"reason": blocked_reason or "channel-not-allowed", "origin": origin_code},
         )
 
     # --- conteúdo para classificar ---
@@ -1104,6 +1113,13 @@ async def ingest_movidesk(
             _log_ingest(INGEST_ACTION_NOTIFY_TEAMS, "error", ticket_id=ticket_id, error_message=str(e))
 
     # --- resposta ---
+    if blocked_reason:
+        skipped_flag = blocked_reason
+    elif not notified and ticket_id in _NOTIFIED_TICKETS:
+        skipped_flag = "already-notified"
+    else:
+        skipped_flag = None
+
     return {
         "ok": True,
         "ticket": {
@@ -1124,7 +1140,7 @@ async def ingest_movidesk(
         "notified_on_teams": notified,
         "llm_used": bool(OPENAI_API_KEY),
         "llm_obj": llm_obj or {},
-        "skipped": None if notified else "already-notified" if ticket_id in _NOTIFIED_TICKETS else None,
+        "skipped": skipped_flag,
     }
 
 # -----------------------------------------------------------------------------#
