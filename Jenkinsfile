@@ -30,13 +30,12 @@ pipeline {
       agent {
         docker {
           image 'node:20-bullseye'
-          args '-u root:root'
+          args '-i --entrypoint="" --user=0:0'
         }
       }
       steps {
         dir('frontend') {
           sh '''
-            set -euxo pipefail
             npm ci
             npm run build
           '''
