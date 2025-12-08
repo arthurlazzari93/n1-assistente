@@ -56,7 +56,11 @@ def _heuristic_summary(text: str, max_chars: int = 900) -> str:
     if core:
         parts.append(core)
     if bullets:
-        parts.append("\nPrincipais pontos:\n" + "\n".join(f"• {re.sub(r'^[-*•]\s+', '', b)}" for b in bullets[:6]))
+        cleaned = []
+        for bullet in bullets[:6]:
+            cleaned.append(re.sub(r"^[-*•]\s+", "", bullet))
+        bullets_block = "\n".join(f"- {item}" for item in cleaned)
+        parts.append("\nPrincipais pontos:\n" + bullets_block)
 
     out = ("\n\n".join(parts)).strip()
     if len(out) > max_chars:
