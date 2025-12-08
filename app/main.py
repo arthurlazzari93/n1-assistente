@@ -897,6 +897,12 @@ async def ingest_movidesk(
         _log_ingest(INGEST_ACTION_PAYLOAD_RECEIVED, "error", error_message="ticket-id-missing")
         raise HTTPException(status_code=400, detail="ID do ticket ausente no payload")
 
+    # =========================
+    # TRAVA NA RAIZ (simples)
+    # =========================
+    # Regra 1: só a primeira CRIAÇÃO do ticket (Status="Novo" e ActionCount=1)
+    status = (payload.get("Status") or "").strip().lower()
+    action_count = int(payload.get("ActionCount") or 0)
     logger.info(f"[INGEST] payload recebido para ticket {ticket_id}: {payload}")
     _log_ingest(
         INGEST_ACTION_PAYLOAD_RECEIVED,
@@ -904,13 +910,6 @@ async def ingest_movidesk(
         ticket_id=ticket_id,
         context={"status": status, "action_count": action_count},
     )
-
-    # =========================
-    # TRAVA NA RAIZ (simples)
-    # =========================
-    # Regra 1: só a primeira CRIAÇÃO do ticket (Status="Novo" e ActionCount=1)
-    status = (payload.get("Status") or "").strip().lower()
-    action_count = int(payload.get("ActionCount") or 0)
     is_first_creation = (status == "novo") and (action_count == 1)
     if not is_first_creation:
         # Ignora quaisquer outros eventos (novas ações, reentregas, etc.)
